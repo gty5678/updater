@@ -43,6 +43,49 @@ def _log(msg: str) -> None:
     print(f"[updater] {msg}", flush=True)
 
 
+def _is_windows_sharing_violation(exc: BaseException) -> bool:
+    if not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "winerror", None) == 32
+
+
+def _extract_error_paths(exc: BaseException) -> list[str]:
+    paths: list[str] = []
+    if isinstance(exc, OSError):
+        for name in ("filename", "filename2"):
+            v = getattr(exc, name, None)
+            if isinstance(v, str) and v.strip():
+                paths.append(v)
+    return paths
+
+
+def _run_fs_with_retry(action_desc: str, func, retries: int = 8, base_sleep: float = 0.25) -> None:
+    last_err: BaseException | None = None
+    for i in range(retries):
+        try:
+            func()
+            return
+        except Exception as e:
+            last_err = e
+            retryable = isinstance(e, PermissionError) or _is_windows_sharing_violation(e)
+            err_paths = _extract_error_paths(e)
+            lock_hint = ""
+            if err_paths:
+                lock_hint = f" | paths={err_paths}"
+            if (not retryable) or i >= retries - 1:
+                if retryable:
+                    _log(f"{action_desc} failed due to file lock: {e!r}{lock_hint}")
+                raise
+            sleep_s = min(2.0, base_sleep * (i + 1))
+            _log(
+                f"{action_desc} failed (attempt {i + 1}/{retries}): "
+                f"{e!r}{lock_hint}; retry in {sleep_s:.2f}s..."
+            )
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise RuntimeError(f"{action_desc} failed after retries: {last_err!r}")
+
+
 def _parse_version_tuple(v: str) -> Optional[tuple[int, ...]]:
     if not v:
         return None
@@ -163,12 +206,15 @@ def copy_tree_overlay_with_keep(src_root: Path, dest_root: Path, keep_rel: set[s
             continue
         # delete everything else
         if item.is_dir():
-            shutil.rmtree(item, ignore_errors=True)
+            _run_fs_with_retry(
+                action_desc=f"Remove directory during overlay: {item}",
+                func=lambda p=item: shutil.rmtree(p, ignore_errors=False),
+            )
         else:
-            try:
-                item.unlink()
-            except Exception:
-                pass
+            _run_fs_with_retry(
+                action_desc=f"Remove file during overlay: {item}",
+                func=lambda p=item: p.unlink(),
+            )
 
     # 2) copy from extracted src_root into dest_root (overwrite)
     for item in src_root.iterdir():
@@ -179,10 +225,16 @@ def copy_tree_overlay_with_keep(src_root: Path, dest_root: Path, keep_rel: set[s
 
         dst = dest_root / item.name
         if item.is_dir():
-            shutil.copytree(item, dst, dirs_exist_ok=True)
+            _run_fs_with_retry(
+                action_desc=f"Copy directory during overlay: {item} -> {dst}",
+                func=lambda s=item, d=dst: shutil.copytree(s, d, dirs_exist_ok=True),
+            )
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, dst)
+            _run_fs_with_retry(
+                action_desc=f"Copy file during overlay: {item} -> {dst}",
+                func=lambda s=item, d=dst: shutil.copy2(s, d),
+            )
 
 
 def discover_extracted_payload(unpacked_dir: Path) -> Path:
@@ -375,9 +427,15 @@ def main() -> int:
             continue
         dst = backup_dir / item.name
         if item.is_dir():
-            shutil.copytree(item, dst, dirs_exist_ok=True)
+            _run_fs_with_retry(
+                action_desc=f"Copy directory during backup: {item} -> {dst}",
+                func=lambda s=item, d=dst: shutil.copytree(s, d, dirs_exist_ok=True),
+            )
         else:
-            shutil.copy2(item, dst)
+            _run_fs_with_retry(
+                action_desc=f"Copy file during backup: {item} -> {dst}",
+                func=lambda s=item, d=dst: shutil.copy2(s, d),
+            )
 
     # 6) 解压 + 覆盖更新 + 启动（失败时可回滚）
     # 保留用户指定条目；同时始终保留 updater/backup 目录

@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.16)
+project(DarkEyeUpdater LANGUAGES CXX C)
+set(CMAKE_CXX_STANDARD 17)
+
+# 依赖：全部使用 3rdparty 本地库
+# 3rdparty/
+#   picosha2/picosha2.h
+#   nlohmann_json/json.hpp
+#   miniz/miniz.h, miniz.c
+set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
+
+add_executable(DarkEyeUpdater
+    src/main.cpp
+    src/download.cpp
+    src/json_parse.cpp
+    src/zip_extract.cpp
+    src/fs_ops.cpp
+    src/process.cpp
+    src/utils.cpp
+    ${THIRDPARTY_DIR}/miniz/miniz.c
+)
+
+target_include_directories(DarkEyeUpdater PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRDPARTY_DIR}/picosha2
+    ${THIRDPARTY_DIR}/nlohmann_json
+    ${THIRDPARTY_DIR}/miniz
+)
+
+target_link_libraries(DarkEyeUpdater PRIVATE
+    winhttp
+)
