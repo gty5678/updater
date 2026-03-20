@@ -6,7 +6,8 @@
 
 namespace updater {
 
-void extractZipToDir(const std::string& zipPath, const std::string& destDir) {
+void extractZipToDir(const std::string& zipPath, const std::string& destDir,
+                     ExtractProgressFn onProgress) {
     mz_zip_archive zip{};
     if (!mz_zip_reader_init_file(&zip, zipPath.c_str(), 0)) {
         throw std::runtime_error("Failed to open zip: " + zipPath);
@@ -16,6 +17,9 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir) {
     std::filesystem::path destBase = std::filesystem::u8path(destDir);
 
     for (mz_uint i = 0; i < numFiles; ++i) {
+        if (onProgress) {
+            onProgress(static_cast<size_t>(i), static_cast<size_t>(numFiles));
+        }
         mz_zip_archive_file_stat stat{};
         if (!mz_zip_reader_file_stat(&zip, i, &stat)) {
             mz_zip_reader_end(&zip);
@@ -41,6 +45,10 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir) {
                 throw std::runtime_error("Failed to extract: " + filename);
             }
         }
+    }
+
+    if (onProgress) {
+        onProgress(static_cast<size_t>(numFiles), static_cast<size_t>(numFiles));
     }
 
     mz_zip_reader_end(&zip);

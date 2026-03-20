@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(DarkEyeUpdater LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 
+# MSVC: 使用 UTF-8 编码，避免日志乱码
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
+
 # 依赖：全部使用 3rdparty 本地库
 # 3rdparty/
 #   picosha2/picosha2.h

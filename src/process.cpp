@@ -5,6 +5,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -91,6 +93,120 @@ bool startMainExe(const std::string& exePath,
         return true;
     }
     return false;
+}
+
+static std::string wideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return "";
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return "";
+    std::string result(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &result[0], size, nullptr, nullptr);
+    result.resize(size - 1);
+    return result;
+}
+
+std::string getCurrentExePath() {
+    wchar_t buf[MAX_PATH + 1] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "";
+    return wideToUtf8(buf);
+}
+
+bool copySelfAndLaunch(const std::string& destPath,
+                       const std::string& workingDir,
+                       int argc, char* argv[]) {
+    std::string selfPath = getCurrentExePath();
+    if (selfPath.empty()) return false;
+
+    std::filesystem::path dest = std::filesystem::u8path(destPath);
+    std::filesystem::path self = std::filesystem::u8path(selfPath);
+    std::filesystem::create_directories(dest.parent_path());
+
+    try {
+        std::filesystem::copy_file(self, dest, std::filesystem::copy_options::overwrite_existing);
+    } catch (...) {
+        return false;
+    }
+
+    std::wstring cmdLineW = L"\"" + utf8ToWide(destPath) + L"\"";
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--running-from-copy") {
+            if (i + 1 < argc) ++i;
+            continue;
+        }
+        cmdLineW += L" ";
+        bool needsQuote = (arg.find(' ') != std::string::npos || arg.find('"') != std::string::npos);
+        if (needsQuote) cmdLineW += L"\"";
+        cmdLineW += utf8ToWide(arg);
+        if (needsQuote) cmdLineW += L"\"";
+    }
+    cmdLineW += L" --running-from-copy \"" + utf8ToWide(destPath) + L"\"";
+
+    std::vector<wchar_t> cmdLineBuf(cmdLineW.begin(), cmdLineW.end());
+    cmdLineBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    std::wstring workDirW = utf8ToWide(workingDir);
+    BOOL ok = CreateProcessW(
+        utf8ToWide(destPath).c_str(),
+        cmdLineBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        workDirW.empty() ? nullptr : workDirW.c_str(),
+        &si,
+        &pi
+    );
+
+    if (ok) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return true;
+    }
+    return false;
+}
+
+void scheduleSelfDelete(const std::string& exePath) {
+    DWORD pid = GetCurrentProcessId();
+    std::wstring exePathW = utf8ToWide(exePath);
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0) return;
+    std::wstring batchPath = tempPath;
+    batchPath += L"DarkEyeUpdater_del_";
+    batchPath += std::to_wstring(pid);
+    batchPath += L".bat";
+
+    std::wofstream batch(batchPath);
+    if (!batch) return;
+    batch << L"@echo off\n";
+    batch << L":loop\n";
+    batch << L"tasklist /fi \"PID eq " << pid << L"\" 2>nul | find \"" << pid << L"\" >nul\n";
+    batch << L"if not errorlevel 1 (timeout /t 1 >nul & goto loop)\n";
+    batch << L"del /f /q \"" << exePathW << L"\"\n";
+    batch << L"del /f /q \"%~f0\"\n";
+    batch.close();
+
+    std::wstring cmdLine = L"cmd /c \"" + batchPath + L"\"";
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, tempPath, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
 }
 
 }  // namespace updater

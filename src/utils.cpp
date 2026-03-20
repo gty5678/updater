@@ -3,6 +3,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include "picosha2.h"
@@ -11,6 +12,50 @@ namespace updater {
 
 void log(const std::string& msg) {
     std::cout << "[updater] " << msg << std::endl;
+}
+
+static std::string formatBytes(size_t bytes) {
+    if (bytes < 1024) return std::to_string(bytes) + " B";
+    if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
+    double mb = static_cast<double>(bytes) / (1024 * 1024);
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1) << mb << " MB";
+    return oss.str();
+}
+
+void printProgressBar(const std::string& label, double percent, size_t current, size_t total,
+                     bool asFiles) {
+    const int barWidth = 40;
+    std::ostringstream line;
+    line << "\r[updater] " << label << " ";
+
+    if (total > 0) {
+        int pos = static_cast<int>(barWidth * percent / 100.0);
+        pos = std::min(pos, barWidth);
+        line << "[";
+        for (int i = 0; i < barWidth; ++i) {
+            line << (i < pos ? "=" : (i == pos ? ">" : " "));
+        }
+        line << "] " << std::fixed << std::setprecision(1) << percent << "% (";
+        if (asFiles) {
+            line << current << " / " << total << " files)";
+        } else {
+            line << formatBytes(current) << " / " << formatBytes(total) << ")";
+        }
+    } else {
+        int pos = (static_cast<int>(current / 1024) % barWidth);
+        line << "[";
+        for (int i = 0; i < barWidth; ++i) {
+            line << (i == pos ? ">" : " ");
+        }
+        line << "] " << formatBytes(current) << " ...";
+    }
+
+    std::cout << line.str() << std::flush;
+}
+
+void progressBarEnd() {
+    std::cout << std::endl;
 }
 
 std::string trim(const std::string& s) {

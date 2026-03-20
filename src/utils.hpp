@@ -1,11 +1,17 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
 namespace updater {
 
 void log(const std::string& msg);
+
+void printProgressBar(const std::string& label, double percent, size_t current, size_t total,
+                     bool asFiles = false);
+
+void progressBarEnd();
 
 std::vector<int> parseVersion(const std::string& v);
 bool isNewer(const std::string& remote, const std::string& local);

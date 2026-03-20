@@ -1,3 +1,7 @@
+/**
+ * DarkEye 更新器主程序
+ * 负责检查更新、下载安装包、解压覆盖、备份与回滚
+ */
 #include "download.hpp"
 #include "fs_ops.hpp"
 #include "json_parse.hpp"
@@ -22,27 +26,30 @@
 
 namespace {
 
+/// 默认的 latest.json 远程地址，用于获取最新版本信息
 const char* DEFAULT_LATEST_JSON_URL =
     "https://raw.githubusercontent.com/de4321/darkeye/main/update/latest.json";
 
+/// 命令行参数与配置
 struct Args {
-    std::string latestJsonUrl = DEFAULT_LATEST_JSON_URL;
-    std::string installDir = ".";
-    std::string mainExe = "DarkEye.exe";
-    std::string currentVersion;
-    std::vector<std::string> keep = {"data"};
-    bool rollbackOnFailure = true;
-    uint32_t pid = 0;
-    int waitTimeoutSeconds = 120;
-    int downloadTimeoutSeconds = 30;
-    int downloadRetries = 3;
-    int packageTimeoutSeconds = 120;
-    std::string mainArgs;
-    bool startMain = true;
-    std::string updaterDir = ".updater";
-    std::string backupDirName = ".updater_backup";
+    std::string latestJsonUrl = DEFAULT_LATEST_JSON_URL;  ///< latest.json 的 URL
+    std::string installDir = ".";                         ///< 应用安装目录
+    std::string mainExe = "DarkEye.exe";                  ///< 主程序可执行文件名
+    std::string currentVersion;                           ///< 当前本地版本号
+    std::vector<std::string> keep = {"data"};             ///< 更新时保留的目录/文件列表
+    bool rollbackOnFailure = true;                        ///< 更新失败时是否回滚
+    uint32_t pid = 0;                                     ///< 主进程 PID，用于等待其退出
+    int waitTimeoutSeconds = 120;                        ///< 等待主进程退出的超时（秒）
+    int downloadTimeoutSeconds = 30;                      ///< 下载 latest.json 的超时
+    int downloadRetries = 3;                              ///< 下载重试次数
+    int packageTimeoutSeconds = 120;                      ///< 下载安装包的超时
+    std::string mainArgs;                                 ///< 启动主程序时传递的参数
+    bool startMain = true;                                 ///< 更新完成后是否自动启动主程序
+    std::string updaterDir = ".updater";                   ///< 更新器工作目录
+    std::string backupDirName = ".updater_backup";         ///< 备份根目录名
 };
 
+/// 解析 --keep 参数，支持逗号分隔，返回去重后的目录名集合
 std::set<std::string> parseKeep(const std::vector<std::string>& keepList) {
     std::set<std::string> result;
     for (const auto& raw : keepList) {
@@ -59,9 +66,26 @@ std::set<std::string> parseKeep(const std::vector<std::string>& keepList) {
     return result;
 }
 
+/// 检查是否以副本方式运行（--running-from-copy <路径>），若是则返回 true 并填充 outPath
+bool hasRunningFromCopy(int argc, char* argv[], std::string& outPath) {
+    outPath.clear();
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--running-from-copy" && i + 1 < argc) {
+            outPath = argv[i + 1];
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 解析命令行参数，填充 args
 void parseArgs(int argc, char* argv[], Args& args) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg == "--running-from-copy") {
+            if (i + 1 < argc) ++i;
+            continue;
+        }
         if (arg == "--latest-json-url" && i + 1 < argc) {
             args.latestJsonUrl = argv[++i];
         } else if (arg == "--install-dir" && i + 1 < argc) {
@@ -100,6 +124,7 @@ void parseArgs(int argc, char* argv[], Args& args) {
     }
 }
 
+/// 生成当前时间戳字符串，格式：YYYYMMDD_HHMMSS
 std::string getTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
@@ -117,12 +142,19 @@ std::string getTimestamp() {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // 退出码：0=成功/无需更新, 1=致命错误, 2=package_url 为空, 3=SHA256 校验失败,
+    //        10=缺少 --current-version, 20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
     int exitCode = 0;
 
 #ifdef _WIN32
+    // 设置控制台为 UTF-8，确保中文日志正常显示
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+
+    // 判断是否已从副本启动（避免覆盖正在运行的 exe）
+    std::string runningFromCopyPath;
+    bool isCopy = hasRunningFromCopy(argc, argv, runningFromCopyPath);
 
     try {
         Args args;
@@ -132,10 +164,20 @@ int main(int argc, char* argv[]) {
         std::filesystem::path updaterDir = appDir / args.updaterDir;
         std::filesystem::path backupRoot = appDir / args.backupDirName;
 
+        // 若非副本运行，先复制自身到临时目录再以副本方式重新启动
+        if (!isCopy) {
+            std::string ts = getTimestamp();
+            std::filesystem::path copyPath = std::filesystem::temp_directory_path() / ("DarkEyeUpdater_" + ts + ".exe");
+            if (updater::copySelfAndLaunch(copyPath.u8string(), appDir.u8string(), argc, argv)) {
+                return 0;
+            }
+        }
+
         auto keepUser = parseKeep(args.keep);
 
         updater::log("Working in: " + appDir.u8string());
 
+        // 校验必须的 --current-version 参数
         std::string localVersion = updater::trim(args.currentVersion);
         if (localVersion.empty()) {
             updater::log("Missing --current-version. Example: --current-version 1.1.1");
@@ -143,6 +185,7 @@ int main(int argc, char* argv[]) {
         }
         updater::log("Local version: " + localVersion);
 
+        // 下载 latest.json 并解析远程版本信息
         auto rawJson = updater::downloadBytes(args.latestJsonUrl,
                                              args.downloadTimeoutSeconds,
                                              args.downloadRetries);
@@ -150,6 +193,7 @@ int main(int argc, char* argv[]) {
         auto latest = updater::loadLatestInfo(jsonStr);
         updater::log("Remote version: " + latest.latestVersion);
 
+        // 比较版本号，若远程不比本地新则无需更新
         if (!updater::isNewer(latest.latestVersion, localVersion)) {
             updater::log("No update needed.");
             return 0;
@@ -157,6 +201,7 @@ int main(int argc, char* argv[]) {
 
         updater::log("Update is available. Preparing package download...");
 
+        // 检查安装包 URL 是否有效
         if (latest.packageUrl.empty()) {
             updater::log("package_url is empty.");
             return 2;
@@ -165,15 +210,23 @@ int main(int argc, char* argv[]) {
         std::filesystem::create_directories(updaterDir);
         std::filesystem::path zipPath = updaterDir / "update.zip";
 
-        auto packed = updater::downloadBytes(latest.packageUrl,
-                                             args.packageTimeoutSeconds,
-                                             args.downloadRetries);
+        // 下载更新包到 .updater/update.zip，带进度条
+        auto packed = updater::downloadBytes(
+            latest.packageUrl,
+            args.packageTimeoutSeconds,
+            args.downloadRetries,
+            [](size_t downloaded, size_t total) {
+                double pct = (total > 0) ? (100.0 * downloaded / total) : 0.0;
+                updater::printProgressBar("Download", pct, downloaded, total, false);
+            });
+        updater::progressBarEnd();
         {
             std::ofstream of(zipPath, std::ios::binary);
             of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
         }
         updater::log("Downloaded update package: " + zipPath.u8string());
 
+        // 若提供了 SHA256，则校验下载文件的完整性
         if (!updater::isPlaceholderSha256(latest.packageSha256)) {
             std::string got = updater::sha256File(zipPath.u8string());
             std::string exp = latest.packageSha256;
@@ -188,6 +241,7 @@ int main(int argc, char* argv[]) {
             updater::log("SHA256 not provided or placeholder; skipping verification.");
         }
 
+        // 等待主进程退出，以便安全覆盖文件
         if (args.pid > 0) {
             updater::log("Waiting for main PID " + std::to_string(args.pid) + " to exit...");
             bool ok = updater::waitForPidExit(args.pid, args.waitTimeoutSeconds);
@@ -199,6 +253,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
         }
 
+        // 创建带时间戳的备份目录并备份当前应用
         std::string ts = getTimestamp();
         std::filesystem::path backupDir = backupRoot / ("backup_" + ts);
         updater::log("Backing up app to: " + backupDir.u8string());
@@ -206,25 +261,35 @@ int main(int argc, char* argv[]) {
         updater::ensureEmptyOrCreate(backupDir.u8string());
         updater::backupAppDir(appDir.u8string(), backupDir.u8string(), args.updaterDir, args.backupDirName);
 
+        // 更新时保留的目录（含 .updater 和 .updater_backup）
         auto keepRelUpdate = keepUser;
         keepRelUpdate.insert(args.updaterDir);
         keepRelUpdate.insert(args.backupDirName);
         auto keepRelRollback = keepRelUpdate;
 
         try {
+            // 解压 zip 到 .updater/unpacked
             updater::log("Unpacking package...");
             std::filesystem::path unpackedDir = updaterDir / "unpacked";
             updater::ensureEmptyOrCreate(unpackedDir.u8string());
 
-            updater::extractZipToDir(zipPath.u8string(), unpackedDir.u8string());
+            updater::extractZipToDir(zipPath.u8string(), unpackedDir.u8string(),
+                [](size_t current, size_t total) {
+                    double pct = (total > 0) ? (100.0 * current / total) : 0.0;
+                    updater::printProgressBar("Extract", pct, current, total, true);
+                });
+            updater::progressBarEnd();
 
+            // 定位解压后的 payload 根目录（可能有一层包装目录）
             std::string payloadRoot = updater::discoverExtractedPayload(unpackedDir.u8string());
             updater::log("Payload root: " + payloadRoot);
 
+            // 将 payload 覆盖到应用目录，保留 keep 中的目录
             updater::log("Overlay updating app/ (keep: ...)...");
             updater::copyTreeOverlayWithKeep(payloadRoot, appDir.u8string(), keepRelUpdate);
 
 #ifdef _WIN32
+            // 更新完成后启动主程序
             if (args.startMain) {
                 std::filesystem::path mainExePath = appDir / args.mainExe;
                 if (!std::filesystem::exists(mainExePath)) {
@@ -242,12 +307,14 @@ int main(int argc, char* argv[]) {
             updater::log("Starting main not implemented on this platform.");
 #endif
 
+            // 清理临时目录：.updater 和 .updater_backup
             updater::safeRemoveTree(updaterDir.u8string(), ".updater");
             updater::safeRemoveTree(backupRoot.u8string(), ".updater_backup");
 
             updater::log("Updater finished.");
             exitCode = 0;
         } catch (const std::exception& e) {
+            // 更新失败：根据配置决定是否从备份回滚
             updater::log(std::string("Update failed: ") + e.what());
             if (args.rollbackOnFailure) {
                 try {
@@ -261,7 +328,15 @@ int main(int argc, char* argv[]) {
                 exitCode = 22;
             }
         }
+
+#ifdef _WIN32
+        // 若从副本运行，更新完成后安排删除临时副本 exe
+        if (isCopy && !runningFromCopyPath.empty()) {
+            updater::scheduleSelfDelete(runningFromCopyPath);
+        }
+#endif
     } catch (const std::exception& e) {
+        // 顶层异常：参数解析、复制自身等早期错误
         updater::log(std::string("Fatal error: ") + e.what());
         exitCode = 1;
     }

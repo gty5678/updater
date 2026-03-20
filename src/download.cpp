@@ -25,7 +25,8 @@ static std::wstring utf8ToWide(const std::string& utf8) {
 
 std::vector<uint8_t> downloadBytes(const std::string& url,
                                    int timeoutSeconds,
-                                   int retries) {
+                                   int retries,
+                                   DownloadProgressFn onProgress) {
     int attempts = std::max(1, retries);
     std::wstring urlW = utf8ToWide(url);
 
@@ -177,6 +178,16 @@ std::vector<uint8_t> downloadBytes(const std::string& url,
             continue;
         }
 
+        DWORD contentLength = 0;
+        DWORD clSize = sizeof(contentLength);
+        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &clSize, WINHTTP_NO_HEADER_INDEX)) {
+            /* got Content-Length */
+        } else {
+            contentLength = 0;
+        }
+        size_t totalBytes = static_cast<size_t>(contentLength);
+
         DWORD bytesAvailable = 0;
         do {
             if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable) || bytesAvailable == 0) break;
@@ -187,6 +198,10 @@ std::vector<uint8_t> downloadBytes(const std::string& url,
             if (!WinHttpReadData(hRequest, data.data() + oldSize, bytesAvailable, &bytesRead)) break;
             if (bytesRead == 0) break;
             data.resize(oldSize + bytesRead);
+
+            if (onProgress) {
+                onProgress(data.size(), totalBytes);
+            }
         } while (bytesAvailable > 0);
 
         WinHttpCloseHandle(hRequest);
