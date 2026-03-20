@@ -12,6 +12,7 @@ endif()
 #   picosha2/picosha2.h
 #   nlohmann_json/json.hpp
 #   miniz/miniz.h, miniz.c
+#   zstd/zstd.h, zstddeclib.c, zstd_errors.h
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
 
 add_executable(DarkEyeUpdater
@@ -19,10 +20,12 @@ add_executable(DarkEyeUpdater
     src/download.cpp
     src/json_parse.cpp
     src/zip_extract.cpp
+    src/tarzst_extract.cpp
     src/fs_ops.cpp
     src/process.cpp
     src/utils.cpp
     ${THIRDPARTY_DIR}/miniz/miniz.c
+    ${THIRDPARTY_DIR}/zstd/zstddeclib.c
 )
 
 target_include_directories(DarkEyeUpdater PRIVATE
@@ -30,6 +33,7 @@ target_include_directories(DarkEyeUpdater PRIVATE
     ${THIRDPARTY_DIR}/picosha2
     ${THIRDPARTY_DIR}/nlohmann_json
     ${THIRDPARTY_DIR}/miniz
+    ${THIRDPARTY_DIR}/zstd
 )
 
 target_link_libraries(DarkEyeUpdater PRIVATE

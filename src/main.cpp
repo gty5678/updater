@@ -6,6 +6,7 @@
 #include "fs_ops.hpp"
 #include "json_parse.hpp"
 #include "process.hpp"
+#include "tarzst_extract.hpp"
 #include "utils.hpp"
 #include "zip_extract.hpp"
 #include <algorithm>
@@ -208,9 +209,25 @@ int main(int argc, char* argv[]) {
         }
 
         std::filesystem::create_directories(updaterDir);
-        std::filesystem::path zipPath = updaterDir / "update.zip";
 
-        // 下载更新包到 .updater/update.zip，带进度条
+        // 根据 package_url 扩展名决定格式：.tar.zst 或 .zip
+        std::string packageExt;
+        {
+            std::string url = latest.packageUrl;
+            size_t q = url.find('?');
+            if (q != std::string::npos) url.resize(q);
+            // 先检查 .tar.zst（多级扩展名，rfind('.') 会误判为 .zst）
+            if (url.size() >= 8 && url.compare(url.size() - 8, 8, ".tar.zst") == 0) {
+                packageExt = ".tar.zst";
+            } else if (url.size() >= 4 && url.compare(url.size() - 4, 4, ".zip") == 0) {
+                packageExt = ".zip";
+            } else {
+                packageExt = ".zip";  // 默认 zip
+            }
+        }
+        std::filesystem::path packagePath = updaterDir / ("update" + packageExt);
+
+        // 下载更新包，带进度条
         auto packed = updater::downloadBytes(
             latest.packageUrl,
             args.packageTimeoutSeconds,
@@ -221,14 +238,14 @@ int main(int argc, char* argv[]) {
             });
         updater::progressBarEnd();
         {
-            std::ofstream of(zipPath, std::ios::binary);
+            std::ofstream of(packagePath, std::ios::binary);
             of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
         }
-        updater::log("Downloaded update package: " + zipPath.u8string());
+        updater::log("Downloaded update package: " + packagePath.u8string());
 
         // 若提供了 SHA256，则校验下载文件的完整性
         if (!updater::isPlaceholderSha256(latest.packageSha256)) {
-            std::string got = updater::sha256File(zipPath.u8string());
+            std::string got = updater::sha256File(packagePath.u8string());
             std::string exp = latest.packageSha256;
             for (auto& c : got) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             for (auto& c : exp) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -268,16 +285,20 @@ int main(int argc, char* argv[]) {
         auto keepRelRollback = keepRelUpdate;
 
         try {
-            // 解压 zip 到 .updater/unpacked
+            // 解压到 .updater/unpacked（zip 或 tar.zst 根据格式自动选择）
             updater::log("Unpacking package...");
             std::filesystem::path unpackedDir = updaterDir / "unpacked";
             updater::ensureEmptyOrCreate(unpackedDir.u8string());
 
-            updater::extractZipToDir(zipPath.u8string(), unpackedDir.u8string(),
-                [](size_t current, size_t total) {
-                    double pct = (total > 0) ? (100.0 * current / total) : 0.0;
-                    updater::printProgressBar("Extract", pct, current, total, true);
-                });
+            auto progressFn = [](size_t current, size_t total) {
+                double pct = (total > 0) ? (100.0 * current / total) : 0.0;
+                updater::printProgressBar("Extract", pct, current, total, true);
+            };
+            if (packageExt == ".tar.zst") {
+                updater::extractTarZstToDir(packagePath.u8string(), unpackedDir.u8string(), progressFn);
+            } else {
+                updater::extractZipToDir(packagePath.u8string(), unpackedDir.u8string(), progressFn);
+            }
             updater::progressBarEnd();
 
             // 定位解压后的 payload 根目录（可能有一层包装目录）
