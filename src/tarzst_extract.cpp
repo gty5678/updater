@@ -74,8 +74,8 @@ std::string buildPath(const char* prefix, size_t prefixLen, const char* name, si
 
 void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDir,
                         ExtractProgressFn onProgress) {
-    // 1. Read compressed file
-    std::ifstream ifs(tarzstPath, std::ios::binary | std::ios::ate);
+    // 1. Read compressed file（path 为 UTF-8；MSVC 下需用 path 打开以支持中文路径）
+    std::ifstream ifs(std::filesystem::u8path(tarzstPath), std::ios::binary | std::ios::ate);
     if (!ifs) {
         throw std::runtime_error("Failed to open: " + tarzstPath);
     }

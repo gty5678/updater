@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 #endif
 #include <chrono>
 #include <iostream>
@@ -155,6 +156,40 @@ void printWelcomeBanner() {
 
 }  // namespace
 
+#ifdef _WIN32
+/// Windows 下 argv 为系统 ANSI，与内部 UTF-8 路径不一致；从 Unicode 命令行解析为 UTF-8
+static std::string wideToUtf8MainArgv(const wchar_t* wide) {
+    if (!wide || !*wide) return "";
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return "";
+    std::string result(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+struct Utf8ArgvHolder {
+    std::vector<std::string> storage;
+    std::vector<char*> argv;
+};
+
+static bool replaceArgvWithUtf8FromCommandLine(Utf8ArgvHolder& out) {
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) return false;
+    out.storage.clear();
+    out.argv.clear();
+    out.storage.reserve(static_cast<size_t>(wargc));
+    for (int i = 0; i < wargc; ++i) {
+        out.storage.push_back(wideToUtf8MainArgv(wargv[i]));
+    }
+    LocalFree(wargv);
+    for (auto& s : out.storage) {
+        out.argv.push_back(s.data());
+    }
+    return true;
+}
+#endif
+
 int main(int argc, char* argv[]) {
     // 退出码：0=成功/无需更新, 1=致命错误, 2=package_url 为空, 3=SHA256 校验失败,
     //        10=缺少 --current-version, 20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
@@ -162,6 +197,11 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // 仅在成功从外部启动主程序后跳过「按回车」，以便关闭控制台；失败则保留窗口查看日志
     bool consolePauseAtExit = true;
+    Utf8ArgvHolder utf8Argv;
+    if (replaceArgvWithUtf8FromCommandLine(utf8Argv)) {
+        argc = static_cast<int>(utf8Argv.argv.size());
+        argv = utf8Argv.argv.data();
+    }
 #endif
 
 #ifdef _WIN32
@@ -182,9 +222,10 @@ int main(int argc, char* argv[]) {
         Args args;
         parseArgs(argc, argv, args);
 
-        std::filesystem::path appDir = std::filesystem::absolute(args.installDir);
-        std::filesystem::path updaterDir = appDir / args.updaterDir;
-        std::filesystem::path backupRoot = appDir / args.backupDirName;
+        std::filesystem::path appDir =
+            std::filesystem::absolute(std::filesystem::u8path(args.installDir));
+        std::filesystem::path updaterDir = appDir / std::filesystem::u8path(args.updaterDir);
+        std::filesystem::path backupRoot = appDir / std::filesystem::u8path(args.backupDirName);
         updaterDirPathToCleanup = updaterDir.u8string();
         backupRootPathToCleanup = backupRoot.u8string();
 
@@ -340,7 +381,7 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
             // 更新完成后启动主程序
             if (args.startMain) {
-                std::filesystem::path mainExePath = appDir / args.mainExe;
+                std::filesystem::path mainExePath = appDir / std::filesystem::u8path(args.mainExe);
                 if (!std::filesystem::exists(mainExePath)) {
                     throw std::runtime_error("Cannot find main exe after update: " + mainExePath.u8string());
                 }

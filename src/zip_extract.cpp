@@ -1,15 +1,44 @@
 #include "zip_extract.hpp"
 #include "utils.hpp"
 #include "miniz.h"
+#include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <vector>
 
 namespace updater {
 
+namespace {
+
+size_t zipWriteToOfstream(void* pOpaque, mz_uint64 ofs, const void* pBuf, size_t n) {
+    (void)ofs;
+    auto* os = static_cast<std::ofstream*>(pOpaque);
+    os->write(static_cast<const char*>(pBuf), static_cast<std::streamsize>(n));
+    return os->good() ? n : 0;
+}
+
+}  // namespace
+
 void extractZipToDir(const std::string& zipPath, const std::string& destDir,
                      ExtractProgressFn onProgress) {
+    // miniz 的 fopen 使用窄路径（非 UTF-8）；整包读入内存后用 init_mem，解压时用 path 打开目标文件
+    std::ifstream ifs(std::filesystem::u8path(zipPath), std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open zip: " + zipPath);
+    }
+    std::streamsize zipSize = ifs.tellg();
+    if (zipSize < 0) {
+        throw std::runtime_error("Failed to size zip: " + zipPath);
+    }
+    ifs.seekg(0);
+    std::vector<uint8_t> zipData(static_cast<size_t>(zipSize));
+    if (zipSize > 0 && !ifs.read(reinterpret_cast<char*>(zipData.data()), zipSize)) {
+        throw std::runtime_error("Failed to read zip: " + zipPath);
+    }
+
     mz_zip_archive zip{};
-    if (!mz_zip_reader_init_file(&zip, zipPath.c_str(), 0)) {
+    if (!mz_zip_reader_init_mem(&zip, zipData.data(), zipData.size(), 0)) {
         throw std::runtime_error("Failed to open zip: " + zipPath);
     }
 
@@ -39,8 +68,12 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
             std::filesystem::create_directories(destPathNorm);
         } else {
             std::filesystem::create_directories(destPathNorm.parent_path());
-            std::string destPathUtf8 = destPathNorm.u8string();
-            if (!mz_zip_reader_extract_to_file(&zip, i, destPathUtf8.c_str(), 0)) {
+            std::ofstream out(destPathNorm, std::ios::binary);
+            if (!out) {
+                mz_zip_reader_end(&zip);
+                throw std::runtime_error("Failed to extract: " + filename);
+            }
+            if (!mz_zip_reader_extract_to_callback(&zip, i, zipWriteToOfstream, &out, 0)) {
                 mz_zip_reader_end(&zip);
                 throw std::runtime_error("Failed to extract: " + filename);
             }
@@ -73,7 +106,7 @@ std::string discoverExtractedPayload(const std::string& unpackedDir) {
     }
 
     if (dirCount == 1 && entryCount == 1) {
-        return singleDir.string();
+        return singleDir.u8string();
     }
     return unpackedDir;
 }

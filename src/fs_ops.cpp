@@ -112,10 +112,11 @@ void backupAppDir(const std::string& appDir,
     std::filesystem::create_directories(backup);
 
     for (const auto& item : std::filesystem::directory_iterator(app)) {
-        std::string name = item.path().filename().u8string();
-        if (ignoreForBackup(name)) continue;
+        std::filesystem::path namePath = item.path().filename();
+        std::string nameUtf8 = namePath.u8string();
+        if (ignoreForBackup(nameUtf8)) continue;
 
-        std::filesystem::path dst = backup / name;
+        std::filesystem::path dst = backup / namePath;
         runFsWithRetry("Copy during backup: " + item.path().u8string() + " -> " + dst.u8string(), [&item, &dst]() {
             if (item.is_directory()) {
                 std::filesystem::copy(item.path(), dst, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
