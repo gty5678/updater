@@ -5,11 +5,51 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace updater {
 
 namespace {
+
+// ZIP 通用位标志 bit 11：文件名/注释使用 UTF-8（与 miniz 内部 MZ_ZIP_GENERAL_PURPOSE_BIT_FLAG_UTF8 一致）
+constexpr mz_uint16 kZipUtf8FilenameFlag = 1u << 11;
+
+std::filesystem::path zipEntryFilenameToPath(const std::string& raw, mz_uint16 bitFlag) {
+    if (raw.empty()) {
+        return {};
+    }
+    if (bitFlag & kZipUtf8FilenameFlag) {
+        return std::filesystem::u8path(raw);
+    }
+#ifdef _WIN32
+    // 未设 UTF-8 标志时，国内常见 zip 为系统 ANSI（如 GBK）；先试严格 UTF-8（部分工具漏设标志）
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(),
+                                   static_cast<int>(raw.size()), nullptr, 0);
+    if (wlen > 0) {
+        std::wstring w(static_cast<size_t>(wlen), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(),
+                            static_cast<int>(raw.size()), w.data(), wlen);
+        return std::filesystem::path(std::move(w));
+    }
+    wlen = MultiByteToWideChar(CP_ACP, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+    if (wlen > 0) {
+        std::wstring w(static_cast<size_t>(wlen), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, raw.data(), static_cast<int>(raw.size()), w.data(), wlen);
+        return std::filesystem::path(std::move(w));
+    }
+#endif
+    return std::filesystem::u8path(raw);
+}
 
 size_t zipWriteToOfstream(void* pOpaque, mz_uint64 ofs, const void* pBuf, size_t n) {
     (void)ofs;
@@ -58,7 +98,7 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
         std::string filename = stat.m_filename;
         if (filename.empty()) continue;
 
-        std::filesystem::path filenamePath = std::filesystem::u8path(filename);
+        std::filesystem::path filenamePath = zipEntryFilenameToPath(filename, stat.m_bit_flag);
         std::filesystem::path destPath = destBase / filenamePath;
         std::filesystem::path destPathNorm = std::filesystem::path(destPath).lexically_normal();
 
