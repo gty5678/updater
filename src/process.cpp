@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -61,38 +62,20 @@ bool startMainExe(const std::string& exePath,
                   const std::string& workingDir,
                   const std::string& mainArgs) {
     std::wstring exePathW = utf8ToWide(exePath);
-    std::wstring cmdLineW = L"\"" + exePathW + L"\"";
-    if (!mainArgs.empty()) {
-        std::wstring mainArgsW = utf8ToWide(mainArgs);
-        cmdLineW += L" " + mainArgsW;
-    }
+    std::wstring workDirW = utf8ToWide(workingDir);
+    std::wstring mainArgsW = utf8ToWide(mainArgs);
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
+    // 使用 Shell 的「打开」启动，与当前控制台进程脱钩，效果类似资源管理器双击
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"open";
+    sei.lpFile = exePathW.c_str();
+    sei.lpDirectory = workDirW.empty() ? nullptr : workDirW.c_str();
+    sei.lpParameters = mainArgs.empty() ? nullptr : mainArgsW.c_str();
+    sei.nShow = SW_SHOWNORMAL;
 
-    std::vector<wchar_t> cmdLineBuf(cmdLineW.begin(), cmdLineW.end());
-    cmdLineBuf.push_back(L'\0');
-
-    BOOL ok = CreateProcessW(
-        exePathW.c_str(),
-        cmdLineBuf.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        0,
-        nullptr,
-        workingDir.empty() ? nullptr : utf8ToWide(workingDir).c_str(),
-        &si,
-        &pi
-    );
-
-    if (ok) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return true;
-    }
-    return false;
+    return ShellExecuteExW(&sei) != FALSE;
 }
 
 static std::string wideToUtf8(const std::wstring& wide) {

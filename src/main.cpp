@@ -142,12 +142,27 @@ std::string getTimestamp() {
     return oss.str();
 }
 
+/// 启动时欢迎横幅（仅在实际执行更新的进程中打印，复制自身后立即退出的实例不打印）
+void printWelcomeBanner() {
+    std::cout
+        << "\n"
+        << "  ============================================================\n"
+        << "       DarkEye 版本更新器\n"
+        << "       欢迎使用 — 即将检查更新并安装\n"
+        << "  ============================================================\n"
+        << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
     // 退出码：0=成功/无需更新, 1=致命错误, 2=package_url 为空, 3=SHA256 校验失败,
     //        10=缺少 --current-version, 20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
     int exitCode = 0;
+#ifdef _WIN32
+    // 仅在成功从外部启动主程序后跳过「按回车」，以便关闭控制台；失败则保留窗口查看日志
+    bool consolePauseAtExit = true;
+#endif
 
 #ifdef _WIN32
     // 设置控制台为 UTF-8，确保中文日志正常显示
@@ -181,6 +196,8 @@ int main(int argc, char* argv[]) {
                 return 0;
             }
         }
+
+        printWelcomeBanner();
 
         auto keepUser = parseKeep(args.keep);
 
@@ -329,7 +346,9 @@ int main(int argc, char* argv[]) {
                 }
                 std::string mainArgs = updater::trim(args.mainArgs);
                 updater::log("Starting main: " + mainExePath.u8string() + (mainArgs.empty() ? "" : " ") + mainArgs);
-                if (!updater::startMainExe(mainExePath.u8string(), appDir.u8string(), mainArgs)) {
+                if (updater::startMainExe(mainExePath.u8string(), appDir.u8string(), mainArgs)) {
+                    consolePauseAtExit = false;
+                } else {
                     updater::log("Failed to start main executable.");
                 }
             } else {
@@ -387,10 +406,11 @@ int main(int argc, char* argv[]) {
 
 exit_main:
 #ifdef _WIN32
-    // 保持控制台窗口打开，便于查看输出
-    std::cout << "\n按回车键退出...";
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    std::cin.get();
+    if (consolePauseAtExit) {
+        std::cout << "\n按回车键退出...";
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        std::cin.get();
+    }
 #endif
 
     return exitCode;

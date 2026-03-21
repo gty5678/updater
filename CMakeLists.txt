@@ -39,4 +39,5 @@ target_include_directories(DarkEyeUpdater PRIVATE
 
 target_link_libraries(DarkEyeUpdater PRIVATE
     winhttp
+    shell32
 )
