@@ -195,8 +195,6 @@ int main(int argc, char* argv[]) {
     //        10=缺少 --current-version, 20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
     int exitCode = 0;
 #ifdef _WIN32
-    // 仅在成功从外部启动主程序后跳过「按回车」，以便关闭控制台；失败则保留窗口查看日志
-    bool consolePauseAtExit = true;
     Utf8ArgvHolder utf8Argv;
     if (replaceArgvWithUtf8FromCommandLine(utf8Argv)) {
         argc = static_cast<int>(utf8Argv.argv.size());
@@ -387,9 +385,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::string mainArgs = updater::trim(args.mainArgs);
                 updater::log("Starting main: " + mainExePath.u8string() + (mainArgs.empty() ? "" : " ") + mainArgs);
-                if (updater::startMainExe(mainExePath.u8string(), appDir.u8string(), mainArgs)) {
-                    consolePauseAtExit = false;
-                } else {
+                if (!updater::startMainExe(mainExePath.u8string(), appDir.u8string(), mainArgs)) {
                     updater::log("Failed to start main executable.");
                 }
             } else {
@@ -447,11 +443,10 @@ int main(int argc, char* argv[]) {
 
 exit_main:
 #ifdef _WIN32
-    if (consolePauseAtExit) {
-        std::cout << "\n按回车键退出...";
-        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-        std::cin.get();
-    }
+    // 成功或失败均暂停，便于查看完整日志
+    std::cout << "\n按回车键退出...";
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::cin.get();
 #endif
 
     return exitCode;

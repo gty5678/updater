@@ -7,3 +7,4 @@ x:\10-Project\darkeye-updater\build\release\DarkEyeUpdater.exe `
 # --no-start-main `
 #  
 #  --latest-json-url https://raw.githubusercontent.com/de4321/darkeye-updater-test/main/update/latest.json `
+#  --latest-json-url http://localhost:8000/latest.json `

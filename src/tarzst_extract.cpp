@@ -1,10 +1,15 @@
 #include "tarzst_extract.hpp"
+#include "utils.hpp"
 #include <zstd.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace updater {
@@ -70,6 +75,83 @@ std::string buildPath(const char* prefix, size_t prefixLen, const char* name, si
     return path;
 }
 
+// PAX extended header (POSIX ustar typeflag 'x' / 'g'): records are
+//   <decimal-length> <space> keyword=value\n
+// length counts the whole line including trailing newline.
+static std::string paxUnescape(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            switch (v[i + 1]) {
+                case '\\':
+                    out += '\\';
+                    ++i;
+                    break;
+                case 'n':
+                    out += '\n';
+                    ++i;
+                    break;
+                case 'r':
+                    out += '\r';
+                    ++i;
+                    break;
+                default:
+                    out += v[i];
+                    break;
+            }
+        } else {
+            out += v[i];
+        }
+    }
+    return out;
+}
+
+// Returns UTF-8 path from PAX `path=` if present (GNU/libarchive use this for Unicode names).
+static std::optional<std::string> parsePaxPathField(const uint8_t* data, size_t size) {
+    const char* p = reinterpret_cast<const char*>(data);
+    const char* end = p + size;
+    std::optional<std::string> best;
+    while (p < end) {
+        while (p < end && (*p == '\0' || *p == '\n')) ++p;
+        if (p >= end) break;
+
+        // Record length (decimal)
+        size_t reclen = 0;
+        const char* q = p;
+        while (q < end && static_cast<unsigned char>(*q) >= '0' && static_cast<unsigned char>(*q) <= '9') {
+            reclen = reclen * 10 + static_cast<size_t>(*q - '0');
+            ++q;
+        }
+        if (q == p || reclen == 0 || static_cast<size_t>(end - p) < reclen) break;
+
+        const char* lineEnd = p + reclen;
+
+        while (q < lineEnd && std::isspace(static_cast<unsigned char>(*q))) ++q;
+        const char* eq = static_cast<const char*>(std::memchr(q, '=', static_cast<size_t>(lineEnd - q)));
+        if (eq && eq < lineEnd) {
+            std::string_view keyword(q, static_cast<size_t>(eq - q));
+            while (!keyword.empty() && std::isspace(static_cast<unsigned char>(keyword.back()))) {
+                keyword.remove_suffix(1);
+            }
+            if (keyword == "path") {
+                std::string_view value(eq + 1, static_cast<size_t>(lineEnd - eq - 1));
+                if (!value.empty() && value.back() == '\n') value.remove_suffix(1);
+                best = paxUnescape(value);
+            }
+        }
+        p = lineEnd;
+    }
+    return best;
+}
+
+// GNU long name / long link: payload is null-terminated path (typeflag 'L' or 'K').
+static std::string gnuLongNameFromData(const uint8_t* data, size_t size) {
+    size_t n = 0;
+    while (n < size && data[n] != '\0') ++n;
+    return std::string(reinterpret_cast<const char*>(data), n);
+}
+
 }  // namespace
 
 void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDir,
@@ -130,6 +212,11 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
 
     std::filesystem::path destBase = std::filesystem::u8path(destDir);
 
+    // GNU / POSIX PAX: UTF-8 path 往往在扩展头 (typeflag 'x') 或 GNU 长文件名 ('L') 中，
+    // 仅读 ustar name/prefix 会得到错误字节序列，在 Windows 上无法创建文件。
+    std::optional<std::string> pendingPaxPath;
+    std::optional<std::string> pendingGnuLongName;
+
     while (p + TAR_BLOCK_SIZE * 2 <= end) {
         if (isZeroBlock(p)) {
             p += TAR_BLOCK_SIZE;
@@ -140,46 +227,121 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         }
 
         const auto* h = reinterpret_cast<const UstarHeader*>(p);
-        size_t fileSize = parseOctal(h->size, 12);
+        size_t entrySize = parseOctal(h->size, 12);
+        const char typeflag = h->typeflag;
 
-        // Build path: prefix + name
+        // PAX extended header (local 'x' / global 'g')
+        if (typeflag == 'x' || typeflag == 'g') {
+            const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
+            if (dataStart + entrySize > end) {
+                log("tar extract: truncated PAX extended header");
+                break;
+            }
+            if (typeflag == 'x') {
+                // 多个连续 x 块会合并；仅当本块含 path= 时更新，避免后续无 path 的块清掉已有路径。
+                if (auto opt = parsePaxPathField(dataStart, entrySize)) {
+                    pendingPaxPath = std::move(opt);
+                }
+            }
+            size_t blockCount = 1 + (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            size_t bytesProcessed = static_cast<size_t>(p - tarData.data()) + blockCount * TAR_BLOCK_SIZE;
+            if (onProgress && totalBytes > 0) {
+                onProgress(std::min(bytesProcessed, totalBytes), totalBytes);
+            }
+            p += TAR_BLOCK_SIZE + ((entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
+            continue;
+        }
+
+        // GNU long name ('L') / long link ('K')
+        if (typeflag == 'L' || typeflag == 'K') {
+            const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
+            if (dataStart + entrySize > end) {
+                log("tar extract: truncated GNU long name/link");
+                break;
+            }
+            if (typeflag == 'L') {
+                pendingGnuLongName = gnuLongNameFromData(dataStart, entrySize);
+            }
+            size_t blockCount = 1 + (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            size_t bytesProcessed = static_cast<size_t>(p - tarData.data()) + blockCount * TAR_BLOCK_SIZE;
+            if (onProgress && totalBytes > 0) {
+                onProgress(std::min(bytesProcessed, totalBytes), totalBytes);
+            }
+            p += TAR_BLOCK_SIZE + ((entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
+            continue;
+        }
+
         size_t nameLen = 0;
         while (nameLen < 100 && h->name[nameLen] != '\0') ++nameLen;
         size_t prefixLen = 0;
         while (prefixLen < 155 && h->prefix[prefixLen] != '\0') ++prefixLen;
 
-        std::string pathStr = buildPath(h->prefix, prefixLen, h->name, nameLen);
+        std::string pathFromUstar = buildPath(h->prefix, prefixLen, h->name, nameLen);
+
+        std::string pathStr;
+        if (pendingPaxPath) {
+            pathStr = std::move(*pendingPaxPath);
+            pendingPaxPath.reset();
+        } else if (pendingGnuLongName) {
+            pathStr = std::move(*pendingGnuLongName);
+            pendingGnuLongName.reset();
+        } else {
+            pathStr = pathFromUstar;
+        }
+
         if (pathStr.empty()) {
-            p += TAR_BLOCK_SIZE + ((fileSize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
+            p += TAR_BLOCK_SIZE + ((entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
             continue;
         }
 
         std::filesystem::path fullPath = destBase / std::filesystem::u8path(pathStr);
         std::filesystem::path fullPathNorm = fullPath.lexically_normal();
 
-        bool isDir = (h->typeflag == '5') ||
+        bool isDir = (typeflag == '5') ||
                      (!pathStr.empty() && (pathStr.back() == '/' || pathStr.back() == '\\'));
 
         if (isDir) {
-            std::filesystem::create_directories(fullPathNorm);
-        } else if (h->typeflag == '0' || h->typeflag == '\0') {
-            std::filesystem::create_directories(fullPathNorm.parent_path());
+            try {
+                std::filesystem::create_directories(fullPathNorm);
+            } catch (const std::exception& e) {
+                log(std::string("tar extract: failed to create directory ") + fullPathNorm.u8string() + ": " +
+                    e.what());
+            }
+        } else if (typeflag == '0' || typeflag == '\0') {
             const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
-            if (dataStart + fileSize <= end) {
-                std::ofstream ofs(fullPathNorm, std::ios::binary);
-                if (ofs) {
-                    ofs.write(reinterpret_cast<const char*>(dataStart), static_cast<std::streamsize>(fileSize));
+            bool parentOk = false;
+            try {
+                std::filesystem::create_directories(fullPathNorm.parent_path());
+                parentOk = true;
+            } catch (const std::exception& e) {
+                log(std::string("tar extract: failed to create parent dir for ") + pathStr + ": " + e.what());
+            }
+            if (parentOk) {
+                if (dataStart + entrySize > end) {
+                    log("tar extract: truncated entry (data past archive end): " + pathStr);
+                } else {
+                    std::ofstream ofs(fullPathNorm, std::ios::binary);
+                    if (!ofs) {
+                        log(std::string("tar extract: failed to open for write: ") + fullPathNorm.u8string());
+                    } else {
+                        ofs.write(reinterpret_cast<const char*>(dataStart), static_cast<std::streamsize>(entrySize));
+                        ofs.flush();
+                        if (!ofs.good()) {
+                            log(std::string("tar extract: write failed: ") + fullPathNorm.u8string());
+                        }
+                    }
                 }
             }
         }
+        // 其它类型（硬链接、符号链接、设备等）：跳过数据块，路径已由 pending* 消费。
 
-        size_t blockCount = 1 + (fileSize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+        size_t blockCount = 1 + (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
         size_t bytesProcessed = static_cast<size_t>(p - tarData.data()) + blockCount * TAR_BLOCK_SIZE;
         if (onProgress && totalBytes > 0) {
             onProgress(std::min(bytesProcessed, totalBytes), totalBytes);
         }
 
-        p += TAR_BLOCK_SIZE + ((fileSize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
+        p += TAR_BLOCK_SIZE + ((entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
     }
 
     if (onProgress && totalBytes > 0) {
