@@ -51,7 +51,23 @@ struct Args {
     bool startMain = true;                                 ///< 更新完成后是否自动启动主程序
     std::string updaterDir = ".updater";                   ///< 更新器工作目录
     std::string backupDirName = ".updater_backup";         ///< 备份根目录名
+    std::string localPackage;                              ///< 非空则使用本地安装包，跳过远程与校验
 };
+
+/// 根据 URL 或文件路径（可含 ?query）判断安装包扩展名：.tar.zst 或 .zip
+/// 先检查 .tar.zst（多级扩展名，rfind('.') 会误判为 .zst）
+std::string packageExtFromUrlOrPath(const std::string& urlOrPath) {
+    std::string s = urlOrPath;
+    size_t q = s.find('?');
+    if (q != std::string::npos) s.resize(q);
+    if (s.size() >= 8 && s.compare(s.size() - 8, 8, ".tar.zst") == 0) {
+        return ".tar.zst";
+    }
+    if (s.size() >= 4 && s.compare(s.size() - 4, 4, ".zip") == 0) {
+        return ".zip";
+    }
+    return ".zip";  // 默认 zip
+}
 
 /// 解析 --keep 参数，支持逗号分隔，返回去重后的目录名集合
 std::set<std::string> parseKeep(const std::vector<std::string>& keepList) {
@@ -124,6 +140,8 @@ void parseArgs(int argc, char* argv[], Args& args) {
             args.updaterDir = argv[++i];
         } else if (arg == "--backup-dir-name" && i + 1 < argc) {
             args.backupDirName = argv[++i];
+        } else if (arg == "--local-package" && i + 1 < argc) {
+            args.localPackage = argv[++i];
         }
     }
 }
@@ -192,7 +210,8 @@ static bool replaceArgvWithUtf8FromCommandLine(Utf8ArgvHolder& out) {
 
 int main(int argc, char* argv[]) {
     // 退出码：0=成功/无需更新, 1=致命错误, 2=package_url 为空, 3=SHA256 校验失败,
-    //        10=缺少 --current-version, 20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
+    //        10=缺少 --current-version, 11=本地安装包路径无效,
+    //        20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
     int exitCode = 0;
 #ifdef _WIN32
     Utf8ArgvHolder utf8Argv;
@@ -242,87 +261,97 @@ int main(int argc, char* argv[]) {
 
         updater::log("Working in: " + appDir.u8string());
 
-        // 校验必须的 --current-version 参数
-        std::string localVersion = updater::trim(args.currentVersion);
-        if (localVersion.empty()) {
-            updater::log("Missing --current-version. Example: --current-version 1.1.1");
-            exitCode = 10;
-            goto exit_main;
-        }
-        updater::log("Local version: " + localVersion);
-
-        // 下载 latest.json 并解析远程版本信息
-        auto rawJson = updater::downloadBytes(args.latestJsonUrl,
-                                             args.downloadTimeoutSeconds,
-                                             args.downloadRetries);
-        std::string jsonStr(rawJson.begin(), rawJson.end());
-        auto latest = updater::loadLatestInfo(jsonStr);
-        updater::log("Remote version: " + latest.latestVersion);
-
-        // 比较版本号，若远程不比本地新则无需更新
-        if (!updater::isNewer(latest.latestVersion, localVersion)) {
-            updater::log("No update needed.");
-            goto exit_main;
-        }
-
-        updater::log("Update is available. Preparing package download...");
-
-        // 检查安装包 URL 是否有效
-        if (latest.packageUrl.empty()) {
-            updater::log("package_url is empty.");
-            exitCode = 2;
-            goto exit_main;
-        }
-
-        std::filesystem::create_directories(updaterDir);
-
-        // 根据 package_url 扩展名决定格式：.tar.zst 或 .zip
+        std::filesystem::path packagePath;
         std::string packageExt;
-        {
-            std::string url = latest.packageUrl;
-            size_t q = url.find('?');
-            if (q != std::string::npos) url.resize(q);
-            // 先检查 .tar.zst（多级扩展名，rfind('.') 会误判为 .zst）
-            if (url.size() >= 8 && url.compare(url.size() - 8, 8, ".tar.zst") == 0) {
-                packageExt = ".tar.zst";
-            } else if (url.size() >= 4 && url.compare(url.size() - 4, 4, ".zip") == 0) {
-                packageExt = ".zip";
-            } else {
-                packageExt = ".zip";  // 默认 zip
-            }
-        }
-        std::filesystem::path packagePath = updaterDir / ("update" + packageExt);
 
-        // 下载更新包，带进度条
-        auto packed = updater::downloadBytes(
-            latest.packageUrl,
-            args.packageTimeoutSeconds,
-            args.downloadRetries,
-            [](size_t downloaded, size_t total) {
-                double pct = (total > 0) ? (100.0 * downloaded / total) : 0.0;
-                updater::printProgressBar("Download", pct, downloaded, total, false);
-            });
-        updater::progressBarEnd();
-        {
-            std::ofstream of(packagePath, std::ios::binary);
-            of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
-        }
-        updater::log("Downloaded update package: " + packagePath.u8string());
-
-        // 若提供了 SHA256，则校验下载文件的完整性
-        if (!updater::isPlaceholderSha256(latest.packageSha256)) {
-            std::string got = updater::sha256File(packagePath.u8string());
-            std::string exp = latest.packageSha256;
-            for (auto& c : got) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            for (auto& c : exp) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (got != exp) {
-                updater::log("SHA256 mismatch. expected=" + exp + " got=" + got);
-                exitCode = 3;
+        if (!args.localPackage.empty()) {
+            // 使用本地安装包：不下载 latest.json，不比较版本，不校验 SHA256
+            packagePath =
+                std::filesystem::absolute(std::filesystem::u8path(args.localPackage));
+            if (!std::filesystem::is_regular_file(packagePath)) {
+                updater::log("Local package not found or not a file: " + packagePath.u8string());
+                exitCode = 11;
                 goto exit_main;
             }
-            updater::log("SHA256 verified.");
+            // 根据路径扩展名决定格式：.tar.zst 或 .zip（规则与 package_url 一致）
+            packageExt = packageExtFromUrlOrPath(packagePath.u8string());
+            std::filesystem::create_directories(updaterDir);
+            updater::log("Local package mode: " + packagePath.u8string());
+            updater::log("Skipping remote version check and SHA256 verification.");
         } else {
-            updater::log("SHA256 not provided or placeholder; skipping verification.");
+            // 校验必须的 --current-version 参数
+            std::string localVersion = updater::trim(args.currentVersion);
+            if (localVersion.empty()) {
+                updater::log("Missing --current-version. Example: --current-version 1.1.1");
+                exitCode = 10;
+                goto exit_main;
+            }
+            updater::log("Local version: " + localVersion);
+
+            // 下载 latest.json 并解析远程版本信息
+            auto rawJson = updater::downloadBytes(args.latestJsonUrl,
+                                                  args.downloadTimeoutSeconds,
+                                                  args.downloadRetries);
+            std::string jsonStr(rawJson.begin(), rawJson.end());
+            auto latest = updater::loadLatestInfo(jsonStr);
+            updater::log("Remote version: " + latest.latestVersion);
+
+            // 比较版本号，若远程不比本地新则无需更新
+            if (!updater::isNewer(latest.latestVersion, localVersion)) {
+                updater::log("No update needed.");
+                goto exit_main;
+            }
+
+            updater::log("Update is available. Preparing package download...");
+
+            // 检查安装包 URL 是否有效
+            if (latest.packageUrl.empty()) {
+                updater::log("package_url is empty.");
+                exitCode = 2;
+                goto exit_main;
+            }
+
+            std::filesystem::create_directories(updaterDir);
+
+            // 根据 package_url 扩展名决定格式：.tar.zst 或 .zip
+            packageExt = packageExtFromUrlOrPath(latest.packageUrl);
+            packagePath = updaterDir / ("update" + packageExt);
+
+            // 下载更新包，带进度条
+            auto packed = updater::downloadBytes(
+                latest.packageUrl,
+                args.packageTimeoutSeconds,
+                args.downloadRetries,
+                [](size_t downloaded, size_t total) {
+                    double pct = (total > 0) ? (100.0 * downloaded / total) : 0.0;
+                    updater::printProgressBar("Download", pct, downloaded, total, false);
+                });
+            updater::progressBarEnd();
+            {
+                std::ofstream of(packagePath, std::ios::binary);
+                of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
+            }
+            updater::log("Downloaded update package: " + packagePath.u8string());
+
+            // 若提供了 SHA256，则校验下载文件的完整性
+            if (!updater::isPlaceholderSha256(latest.packageSha256)) {
+                std::string got = updater::sha256File(packagePath.u8string());
+                std::string exp = latest.packageSha256;
+                for (auto& c : got) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                for (auto& c : exp) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                if (got != exp) {
+                    updater::log("SHA256 mismatch. expected=" + exp + " got=" + got);
+                    exitCode = 3;
+                    goto exit_main;
+                }
+                updater::log("SHA256 verified.");
+            } else {
+                updater::log("SHA256 not provided or placeholder; skipping verification.");
+            }
         }
 
         // 等待主进程退出，以便安全覆盖文件
