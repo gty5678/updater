@@ -14,18 +14,22 @@ void log(const std::string& msg) {
     std::cout << "[updater] " << msg << std::endl;
 }
 
-static std::string formatBytes(size_t bytes) {
+static std::string formatBytes(size_t bytes, int mbDecimals) {
     if (bytes < 1024) return std::to_string(bytes) + " B";
     if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
     double mb = static_cast<double>(bytes) / (1024 * 1024);
     std::ostringstream oss;
-    oss << std::fixed << std::setprecision(1) << mb << " MB";
+    oss << std::fixed << std::setprecision(mbDecimals) << mb << " MB";
     return oss.str();
 }
 
 void printProgressBar(const std::string& label, double percent, size_t current, size_t total,
                      bool asFiles) {
     const int barWidth = 40;
+    // 只对下载显示更高精度：百分比和 MB 都保留两位小数
+    const bool isDownload = (label == "Download");
+    const int percentDecimals = isDownload ? 2 : 1;
+    const int mbDecimals = isDownload ? 2 : 1;
     std::ostringstream line;
     line << "\r[updater] " << label << " ";
 
@@ -36,11 +40,11 @@ void printProgressBar(const std::string& label, double percent, size_t current, 
         for (int i = 0; i < barWidth; ++i) {
             line << (i < pos ? "=" : (i == pos ? ">" : " "));
         }
-        line << "] " << std::fixed << std::setprecision(1) << percent << "% (";
+        line << "] " << std::fixed << std::setprecision(percentDecimals) << percent << "% (";
         if (asFiles) {
             line << current << " / " << total << " files)";
         } else {
-            line << formatBytes(current) << " / " << formatBytes(total) << ")";
+            line << formatBytes(current, mbDecimals) << " / " << formatBytes(total, mbDecimals) << ")";
         }
     } else {
         int pos = (static_cast<int>(current / 1024) % barWidth);
@@ -48,7 +52,7 @@ void printProgressBar(const std::string& label, double percent, size_t current, 
         for (int i = 0; i < barWidth; ++i) {
             line << (i == pos ? ">" : " ");
         }
-        line << "] " << formatBytes(current) << " ...";
+        line << "] " << formatBytes(current, mbDecimals) << " ...";
     }
 
     std::cout << line.str() << std::flush;

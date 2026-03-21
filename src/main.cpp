@@ -10,11 +10,13 @@
 #include "utils.hpp"
 #include "zip_extract.hpp"
 #include <algorithm>
+#include <limits>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
 #endif
 #include <chrono>
+#include <iostream>
 #include <cstring>
 #include <set>
 #include <filesystem>
@@ -157,6 +159,10 @@ int main(int argc, char* argv[]) {
     std::string runningFromCopyPath;
     bool isCopy = hasRunningFromCopy(argc, argv, runningFromCopyPath);
 
+    // 最外层失败兜底清理（例如下载阶段超时抛异常时）
+    std::string updaterDirPathToCleanup;
+    std::string backupRootPathToCleanup;
+
     try {
         Args args;
         parseArgs(argc, argv, args);
@@ -164,6 +170,8 @@ int main(int argc, char* argv[]) {
         std::filesystem::path appDir = std::filesystem::absolute(args.installDir);
         std::filesystem::path updaterDir = appDir / args.updaterDir;
         std::filesystem::path backupRoot = appDir / args.backupDirName;
+        updaterDirPathToCleanup = updaterDir.u8string();
+        backupRootPathToCleanup = backupRoot.u8string();
 
         // 若非副本运行，先复制自身到临时目录再以副本方式重新启动
         if (!isCopy) {
@@ -182,7 +190,8 @@ int main(int argc, char* argv[]) {
         std::string localVersion = updater::trim(args.currentVersion);
         if (localVersion.empty()) {
             updater::log("Missing --current-version. Example: --current-version 1.1.1");
-            return 10;
+            exitCode = 10;
+            goto exit_main;
         }
         updater::log("Local version: " + localVersion);
 
@@ -197,7 +206,7 @@ int main(int argc, char* argv[]) {
         // 比较版本号，若远程不比本地新则无需更新
         if (!updater::isNewer(latest.latestVersion, localVersion)) {
             updater::log("No update needed.");
-            return 0;
+            goto exit_main;
         }
 
         updater::log("Update is available. Preparing package download...");
@@ -205,7 +214,8 @@ int main(int argc, char* argv[]) {
         // 检查安装包 URL 是否有效
         if (latest.packageUrl.empty()) {
             updater::log("package_url is empty.");
-            return 2;
+            exitCode = 2;
+            goto exit_main;
         }
 
         std::filesystem::create_directories(updaterDir);
@@ -251,7 +261,8 @@ int main(int argc, char* argv[]) {
             for (auto& c : exp) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (got != exp) {
                 updater::log("SHA256 mismatch. expected=" + exp + " got=" + got);
-                return 3;
+                exitCode = 3;
+                goto exit_main;
             }
             updater::log("SHA256 verified.");
         } else {
@@ -348,6 +359,10 @@ int main(int argc, char* argv[]) {
             } else {
                 exitCode = 22;
             }
+
+            // 失败回退完成后：从用户视角不应残留更新器临时目录
+            updater::safeRemoveTree(updaterDir.u8string(), ".updater");
+            updater::safeRemoveTree(backupRoot.u8string(), ".updater_backup");
         }
 
 #ifdef _WIN32
@@ -360,7 +375,23 @@ int main(int argc, char* argv[]) {
         // 顶层异常：参数解析、复制自身等早期错误
         updater::log(std::string("Fatal error: ") + e.what());
         exitCode = 1;
+
+        // 下载阶段失败也要从用户视角保证不残留更新器目录
+        if (!updaterDirPathToCleanup.empty()) {
+            updater::safeRemoveTree(updaterDirPathToCleanup, ".updater");
+        }
+        if (!backupRootPathToCleanup.empty()) {
+            updater::safeRemoveTree(backupRootPathToCleanup, ".updater_backup");
+        }
     }
+
+exit_main:
+#ifdef _WIN32
+    // 保持控制台窗口打开，便于查看输出
+    std::cout << "\n按回车键退出...";
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::cin.get();
+#endif
 
     return exitCode;
 }

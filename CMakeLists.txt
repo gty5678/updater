@@ -2,9 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 project(DarkEyeUpdater LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 
-# MSVC: 使用 UTF-8 编码，避免日志乱码
+# MSVC: 使用 UTF-8 编码，避免日志乱码；静态链接运行时，生成无外部 DLL 依赖的单 exe
 if(MSVC)
   add_compile_options(/utf-8)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # 依赖：全部使用 3rdparty 本地库
