@@ -14,7 +14,12 @@ endif()
 #   nlohmann_json/json.hpp
 #   miniz/miniz.h, miniz.c
 #   zstd/zstd.h, zstddeclib.c, zstd_errors.h
+#   curl/include/curl/*.h ，curl/lib/libcurl.lib（静态、/MT、Schannel 与工程一致）
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
+set(CURL_LIB "${THIRDPARTY_DIR}/curl/lib/libcurl.lib")
+if(NOT EXISTS "${CURL_LIB}")
+  message(FATAL_ERROR "缺少 libcurl：请将 libcurl.lib 放到 3rdparty/curl/lib/（与当前 MSVC /MT 一致）")
+endif()
 
 add_executable(DarkEyeUpdater
     src/main.cpp
@@ -35,9 +40,19 @@ target_include_directories(DarkEyeUpdater PRIVATE
     ${THIRDPARTY_DIR}/nlohmann_json
     ${THIRDPARTY_DIR}/miniz
     ${THIRDPARTY_DIR}/zstd
+    ${THIRDPARTY_DIR}/curl/include
 )
 
+target_compile_definitions(DarkEyeUpdater PRIVATE CURL_STATICLIB)
+
 target_link_libraries(DarkEyeUpdater PRIVATE
-    winhttp
+    "${CURL_LIB}"
+    ws2_32
+    crypt32
+    advapi32
+    normaliz
+    secur32
+    bcrypt
+    iphlpapi
     shell32
 )

@@ -1,243 +1,134 @@
 #include "download.hpp"
 #include "utils.hpp"
+#ifndef NOMINMAX
 #define NOMINMAX
-#include <windows.h>
-#include <winhttp.h>
+#endif
+#include <curl/curl.h>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
-
-#pragma comment(lib, "winhttp.lib")
-
-// 与较新 Windows SDK winhttp.h 一致；旧头文件可能缺少 HTTP/3 常量
-#ifndef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
-#define WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL 133
-#endif
-#ifndef WINHTTP_PROTOCOL_FLAG_HTTP2
-#define WINHTTP_PROTOCOL_FLAG_HTTP2 0x1
-#endif
-#ifndef WINHTTP_PROTOCOL_FLAG_HTTP3
-#define WINHTTP_PROTOCOL_FLAG_HTTP3 0x2
-#endif
 
 namespace updater {
 
-constexpr DWORD kDownloadReadBufferBytes = 256 * 1024;
+namespace {
 
-static std::wstring utf8ToWide(const std::string& utf8) {
-    if (utf8.empty()) return L"";
+/** 与常见浏览器一致，便于 CDN/服务器同等调度；末尾保留本程序标识。 */
+static const char kDownloadUserAgent[] =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36 DarkEyeUpdater/1.0";
 
-    int size = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
-    if (size <= 0) return L"";
+std::once_flag gCurlInitOnce;
 
-    std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &result[0], size);
-    result.resize(size - 1);
-    return result;
+void curlGlobalInitOnce() {
+    std::call_once(gCurlInitOnce, []() {
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+            throw std::runtime_error("curl_global_init failed");
+        }
+    });
 }
+
+size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* data = static_cast<std::vector<uint8_t>*>(userdata);
+    const size_t n = size * nmemb;
+    const size_t oldSize = data->size();
+    data->resize(oldSize + n);
+    if (n > 0) {
+        std::memcpy(data->data() + oldSize, ptr, n);
+    }
+    return n;
+}
+
+struct ProgressState {
+    DownloadProgressFn onProgress;
+};
+
+int xferinfoCallback(void* clientp,
+                     curl_off_t dltotal,
+                     curl_off_t dlnow,
+                     curl_off_t /*ultotal*/,
+                     curl_off_t /*ulnow*/) {
+    auto* st = static_cast<ProgressState*>(clientp);
+    if (!st->onProgress) {
+        return 0;
+    }
+    const size_t total = (dltotal > 0) ? static_cast<size_t>(dltotal) : 0;
+    st->onProgress(static_cast<size_t>(dlnow), total);
+    return 0;
+}
+
+}  // namespace
 
 std::vector<uint8_t> downloadBytes(const std::string& url,
                                    int timeoutSeconds,
                                    int retries,
                                    DownloadProgressFn onProgress) {
+    curlGlobalInitOnce();
+
     int attempts = std::max(1, retries);
-    std::wstring urlW = utf8ToWide(url);
+    const long timeoutSec = std::max(1, timeoutSeconds);
 
     for (int i = 0; i < attempts; ++i) {
         std::vector<uint8_t> data;
-        URL_COMPONENTS urlComp{};
-        urlComp.dwStructSize = sizeof(urlComp);
-        wchar_t hostBuf[256] = {};
-        wchar_t pathBuf[2048] = {};
-        urlComp.lpszHostName = hostBuf;
-        urlComp.dwHostNameLength = 256;
-        urlComp.lpszUrlPath = pathBuf;
-        urlComp.dwUrlPathLength = 2048;
-
-        if (!WinHttpCrackUrl(urlW.c_str(), 0, 0, &urlComp)) {
+        CURL* curl = curl_easy_init();
+        if (!curl) {
             if (i < attempts - 1) {
                 int sleepSec = std::min(8, 1 + i * 2);
                 log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): URL parse error; retry in " + std::to_string(sleepSec) + "s...");
+                    "): curl_easy_init failed; retry in " + std::to_string(sleepSec) + "s...");
                 std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
             } else {
-                throw std::runtime_error("Download failed: invalid URL " + url);
+                throw std::runtime_error("Download failed: curl_easy_init failed");
             }
             continue;
         }
 
-        INTERNET_PORT port = urlComp.nPort;
-        if (port == 0) {
-            port = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
-        }
+        ProgressState progressSt{onProgress};
 
-        HINTERNET hSession = WinHttpOpen(
-            L"DarkEye-Updater/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0
-        );
-        if (!hSession) {
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): WinHttpOpen failed; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed: WinHttpOpen failed");
-            }
-            continue;
-        }
-
-        DWORD timeoutMs = static_cast<DWORD>(timeoutSeconds) * 1000;
-        WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-        WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-        WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-
-        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-        WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
-
-        if (urlComp.nScheme == INTERNET_SCHEME_HTTPS) {
-            DWORD protocols = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
-            WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &protocols, sizeof(protocols));
-        }
-
-        HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, port, 0);
-        if (!hConnect) {
-            WinHttpCloseHandle(hSession);
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): WinHttpConnect failed; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed: WinHttpConnect failed");
-            }
-            continue;
-        }
-
-        LPCWSTR verb = L"GET";
-        DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-
-        HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect,
-            verb,
-            urlComp.lpszUrlPath[0] ? urlComp.lpszUrlPath : L"/",
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            flags
-        );
-        if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): WinHttpOpenRequest failed; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed: WinHttpOpenRequest failed");
-            }
-            continue;
-        }
-
-        BOOL sendOk = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-        if (!sendOk) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): WinHttpSendRequest failed; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed: WinHttpSendRequest failed");
-            }
-            continue;
-        }
-
-        BOOL recvOk = WinHttpReceiveResponse(hRequest, nullptr);
-        if (!recvOk) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): WinHttpReceiveResponse failed; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed: WinHttpReceiveResponse failed");
-            }
-            continue;
-        }
-
-        DWORD statusCode = 0;
-        DWORD statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-
-        if (statusCode < 200 || statusCode >= 300) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            if (i < attempts - 1) {
-                int sleepSec = std::min(8, 1 + i * 2);
-                log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) +
-                    "): HTTP " + std::to_string(statusCode) + "; retry in " + std::to_string(sleepSec) + "s...");
-                std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
-            } else {
-                throw std::runtime_error("Download failed after " + std::to_string(attempts) + " attempts: HTTP " + std::to_string(statusCode));
-            }
-            continue;
-        }
-
-        DWORD contentLength = 0;
-        DWORD clSize = sizeof(contentLength);
-        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &clSize, WINHTTP_NO_HEADER_INDEX)) {
-            /* got Content-Length */
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, kDownloadUserAgent);
+        /* 优先 HTTP/3，库未编 QUIC 或网络不支持时由 libcurl 回落至 HTTP/2 / 1.1（HTTP/2 需编进 nghttp2） */
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_3);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 20L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSec);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeoutSec);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
+        if (onProgress) {
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfoCallback);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progressSt);
         } else {
-            contentLength = 0;
-        }
-        size_t totalBytes = static_cast<size_t>(contentLength);
-
-        for (;;) {
-            DWORD bytesAvailable = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable) || bytesAvailable == 0) {
-                break;
-            }
-
-            const DWORD toRead = (bytesAvailable > kDownloadReadBufferBytes)
-                                       ? kDownloadReadBufferBytes
-                                       : bytesAvailable;
-            const size_t oldSize = data.size();
-            data.resize(oldSize + toRead);
-            DWORD bytesRead = 0;
-            if (!WinHttpReadData(hRequest, data.data() + oldSize, toRead, &bytesRead)) {
-                data.resize(oldSize);
-                break;
-            }
-            if (bytesRead == 0) {
-                data.resize(oldSize);
-                break;
-            }
-            data.resize(oldSize + bytesRead);
-
-            if (onProgress) {
-                onProgress(data.size(), totalBytes);
-            }
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
         }
 
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        CURLcode res = curl_easy_perform(curl);
+        long httpCode = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        curl_easy_cleanup(curl);
 
-        return data;
+        if (res == CURLE_OK && httpCode >= 200 && httpCode < 300) {
+            return data;
+        }
+
+        if (i < attempts - 1) {
+            int sleepSec = std::min(8, 1 + i * 2);
+            std::string detail = (res != CURLE_OK) ? std::string(curl_easy_strerror(res)) : ("HTTP " + std::to_string(httpCode));
+            log("Download failed (attempt " + std::to_string(i + 1) + "/" + std::to_string(attempts) + "): " + detail +
+                "; retry in " + std::to_string(sleepSec) + "s...");
+            std::this_thread::sleep_for(std::chrono::seconds(sleepSec));
+        } else {
+            if (res != CURLE_OK) {
+                throw std::runtime_error(std::string("Download failed after ") + std::to_string(attempts) +
+                                         " attempts: " + curl_easy_strerror(res));
+            }
+            throw std::runtime_error("Download failed after " + std::to_string(attempts) + " attempts: HTTP " +
+                                     std::to_string(httpCode));
+        }
     }
 
     throw std::runtime_error("Download failed");
