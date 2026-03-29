@@ -9,7 +9,20 @@
 
 #pragma comment(lib, "winhttp.lib")
 
+// 与较新 Windows SDK winhttp.h 一致；旧头文件可能缺少 HTTP/3 常量
+#ifndef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+#define WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL 133
+#endif
+#ifndef WINHTTP_PROTOCOL_FLAG_HTTP2
+#define WINHTTP_PROTOCOL_FLAG_HTTP2 0x1
+#endif
+#ifndef WINHTTP_PROTOCOL_FLAG_HTTP3
+#define WINHTTP_PROTOCOL_FLAG_HTTP3 0x2
+#endif
+
 namespace updater {
+
+constexpr DWORD kDownloadReadBufferBytes = 256 * 1024;
 
 static std::wstring utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) return L"";
@@ -84,6 +97,11 @@ std::vector<uint8_t> downloadBytes(const std::string& url,
 
         DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
         WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+        if (urlComp.nScheme == INTERNET_SCHEME_HTTPS) {
+            DWORD protocols = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+            WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &protocols, sizeof(protocols));
+        }
 
         HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, port, 0);
         if (!hConnect) {
@@ -188,21 +206,32 @@ std::vector<uint8_t> downloadBytes(const std::string& url,
         }
         size_t totalBytes = static_cast<size_t>(contentLength);
 
-        DWORD bytesAvailable = 0;
-        do {
-            if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable) || bytesAvailable == 0) break;
+        for (;;) {
+            DWORD bytesAvailable = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &bytesAvailable) || bytesAvailable == 0) {
+                break;
+            }
 
-            size_t oldSize = data.size();
-            data.resize(oldSize + bytesAvailable);
+            const DWORD toRead = (bytesAvailable > kDownloadReadBufferBytes)
+                                       ? kDownloadReadBufferBytes
+                                       : bytesAvailable;
+            const size_t oldSize = data.size();
+            data.resize(oldSize + toRead);
             DWORD bytesRead = 0;
-            if (!WinHttpReadData(hRequest, data.data() + oldSize, bytesAvailable, &bytesRead)) break;
-            if (bytesRead == 0) break;
+            if (!WinHttpReadData(hRequest, data.data() + oldSize, toRead, &bytesRead)) {
+                data.resize(oldSize);
+                break;
+            }
+            if (bytesRead == 0) {
+                data.resize(oldSize);
+                break;
+            }
             data.resize(oldSize + bytesRead);
 
             if (onProgress) {
                 onProgress(data.size(), totalBytes);
             }
-        } while (bytesAvailable > 0);
+        }
 
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
