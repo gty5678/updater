@@ -108,7 +108,7 @@ static std::string paxUnescape(std::string_view v) {
 }
 
 // Returns UTF-8 path from PAX `path=` if present (GNU/libarchive use this for Unicode names).
-static std::optional<std::string> parsePaxPathField(const uint8_t* data, size_t size) {
+static std::optional<std::string> parsePaxPathField(const uint8_t* data, size_t size, std::string_view field = "path") {
     const char* p = reinterpret_cast<const char*>(data);
     const char* end = p + size;
     std::optional<std::string> best;
@@ -134,7 +134,7 @@ static std::optional<std::string> parsePaxPathField(const uint8_t* data, size_t 
             while (!keyword.empty() && std::isspace(static_cast<unsigned char>(keyword.back()))) {
                 keyword.remove_suffix(1);
             }
-            if (keyword == "path") {
+            if (keyword == field) {
                 std::string_view value(eq + 1, static_cast<size_t>(lineEnd - eq - 1));
                 if (!value.empty() && value.back() == '\n') value.remove_suffix(1);
                 best = paxUnescape(value);
@@ -221,6 +221,8 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
     // 仅读 ustar name/prefix 会得到错误字节序列，在 Windows 上无法创建文件。
     std::optional<std::string> pendingPaxPath;
     std::optional<std::string> pendingGnuLongName;
+    std::optional<std::string> pendingLink;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> links;
 
     bool reachedEnd = false;
     while (static_cast<size_t>(end - p) >= TAR_BLOCK_SIZE * 2) {
@@ -245,6 +247,8 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         if (typeflag == 'x' || typeflag == 'g') {
             const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
             if (typeflag == 'x') {
+                if (auto link = parsePaxPathField(dataStart, entrySize, "linkpath"))
+                    pendingLink = std::move(link);
                 // 多个连续 x 块会合并；仅当本块含 path= 时更新，避免后续无 path 的块清掉已有路径。
                 if (auto opt = parsePaxPathField(dataStart, entrySize)) {
                     pendingPaxPath = std::move(opt);
@@ -264,6 +268,8 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
             const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
             if (typeflag == 'L') {
                 pendingGnuLongName = gnuLongNameFromData(dataStart, entrySize);
+            } else {
+                pendingLink = gnuLongNameFromData(dataStart, entrySize);
             }
             size_t blockCount = 1 + (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
             size_t bytesProcessed = static_cast<size_t>(p - tarData.data()) + blockCount * TAR_BLOCK_SIZE;
@@ -301,7 +307,18 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         const auto relative = safeRelativePath(std::filesystem::u8path(pathStr));
         const auto destination = destBase / relative;
 
-        if (typeflag == '5') {
+        std::string linkText = pendingLink.value_or(
+            std::string(h->linkname, strnlen(h->linkname, sizeof(h->linkname))));
+        pendingLink.reset();
+        if (typeflag == '2') {
+            const auto target = std::filesystem::u8path(linkText);
+            if (linkText.empty() || linkText.size() > 4096 ||
+                linkText.find('\0') != std::string::npos ||
+                linkText.find('\\') != std::string::npos || target.is_absolute())
+                throw std::runtime_error("Unsafe TAR symlink: " + pathStr);
+            safeRelativePath((relative.parent_path() / target).lexically_normal());
+            links.emplace_back(destination, target);
+        } else if (typeflag == '5') {
             std::filesystem::create_directories(destination);
         } else if (typeflag == '0' || typeflag == '\0') {
             std::filesystem::create_directories(destination.parent_path());
@@ -328,6 +345,19 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
     }
 
     if (!reachedEnd) throw std::runtime_error("Missing tar end marker");
+    // Defer links until all ordinary entries have been written, so no archive
+    // entry can write through a link. Validate both lexical and resolved targets.
+    for (const auto& link : links) {
+        const auto resolved = std::filesystem::weakly_canonical(link.first.parent_path() / link.second);
+        safeRelativePath(resolved.lexically_relative(std::filesystem::weakly_canonical(destBase)));
+        for (auto parent = link.first.parent_path(); parent != destBase && !parent.empty(); parent = parent.parent_path())
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(parent)))
+                throw std::runtime_error("TAR symlink parent is a link");
+        std::filesystem::create_directories(link.first.parent_path());
+        if (std::filesystem::exists(std::filesystem::symlink_status(link.first)))
+            throw std::runtime_error("Duplicate TAR symlink path");
+        std::filesystem::create_symlink(link.second, link.first);
+    }
     if (onProgress && totalBytes > 0) {
         onProgress(totalBytes, totalBytes);  // 100% at end
     }

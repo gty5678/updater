@@ -443,7 +443,19 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error("Launch executable missing in payload: " + args.mainExe);
             }
 
+            const bool replaceBundle = appDir.extension() == ".app" && payloadRoot.extension() == ".app";
+            if (replaceBundle && !fs::is_regular_file(payloadRoot / "Contents/Info.plist"))
+                throw std::runtime_error("Application bundle is missing Contents/Info.plist");
             installationStarted = true;
+            if (replaceBundle) {
+                // Keep updater working state until commit/rollback, but remove
+                // obsolete bundle content instead of leaving stale resources.
+                for (const auto& item : fs::directory_iterator(appDir)) {
+                    const auto name = item.path().filename().u8string();
+                    if (name != args.updaterDir && name != args.backupDirName && name != ".update-lock")
+                        fs::remove_all(item.path());
+                }
+            }
             updater::copyTreeOverlayWithKeep(payloadRoot.u8string(), appDir.u8string(), keepRelUpdate);
 
             if (args.startMain) {
