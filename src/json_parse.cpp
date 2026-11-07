@@ -21,8 +21,7 @@ LatestInfo loadLatestInfo(const std::string& jsonContent, const std::string& pla
             throw std::runtime_error("Manifest has no package for " + platform);
         }
         package = &packages.at(platform);
-    } else if (j.contains("package")) {
-        package = &j.at("package");
+
     }
     if (package && package->is_object()) {
         info.packageUrl = trim(package->value("url", ""));
@@ -33,8 +32,7 @@ LatestInfo loadLatestInfo(const std::string& jsonContent, const std::string& pla
         throw std::runtime_error("latest.json missing fields: latestVersion/package.url");
     }
 
-    if (j.contains("packages") &&
-        (info.packageSha256.size() != 64 ||
+    if ((info.packageSha256.size() != 64 ||
          !std::all_of(info.packageSha256.begin(), info.packageSha256.end(),
                       [](unsigned char c) { return std::isxdigit(c) != 0; }) ||
          info.packageSha256.find_first_not_of('0') == std::string::npos)) {
