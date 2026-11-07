@@ -77,6 +77,20 @@ Windows 打包脚本会自动查找 PATH 中的 vcpkg、仓库内的 `vcpkg`、�
 
 vcpkg 提供的第三方库静态链接进产物。Windows 使用静态 MSVC 运行库 `/MT`，脚本用 `dumpbin` 检查导入表，运行时使用 Windows 系统 DLL。Linux 使用 `-static`，脚本通过 `readelf` 检查 ELF 的动态依赖和解释器。macOS 使用系统运行库和系统框架，脚本用 `otool` 检查动态依赖。Intel 和 Apple Silicon 分别构建。macOS 发布所需的签名与公证应在构建之后按发行渠道处理。HTTPS 验证依赖目标系统可用的信任证书。
 
+## 自动更新测试
+
+构建完成后，在仓库根目录使用 Python 3 运行集成测试，无需安装 Python 第三方依赖：
+
+```powershell
+python tests/test_updates.py
+```
+
+默认测试 `dist/windows-x64/updater.exe`。测试其他构建时，可先设置 `UPDATER_EXE` 环境变量为更新器的绝对路径。
+
+测试自动在 `build/integration-tests` 中生成隔离的旧版应用和新版 ZIP，结束后清理。在线场景使用本机回环 HTTP 服务，无需外部更新源。12 个用例覆盖完整替换、旧文件清理、保留用户数据、包根目录识别、在线下载与 SHA-256 校验、同版本跳过、包损坏与路径越界拒绝、安装锁，以及启动失败回滚。测试核对退出码、文件内容和工作目录清理情况。
+
+当前用例使用 ZIP；tar.zst、真实应用启动和各目标平台仍需单独验证。
+
 ## 应用接入
 
 更新器放在应用安装目录之外。安装目录必须已存在，并且只包含这个应用的文件。更新包提供完整的新版本，旧版本中未通过 `--keep` 指定的内容会被替换。
