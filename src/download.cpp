@@ -15,10 +15,7 @@ namespace updater {
 
 namespace {
 
-/** 与常见浏览器一致，便于 CDN/服务器同等调度；末尾保留本程序标识。 */
-static const char kDownloadUserAgent[] =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36 DarkEyeUpdater/1.0";
+constexpr char kDownloadUserAgent[] = "Updater/1.0";
 
 std::once_flag gCurlInitOnce;
 
@@ -89,8 +86,9 @@ std::vector<uint8_t> downloadBytes(const std::string& url,
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_USERAGENT, kDownloadUserAgent);
-        /* 优先 HTTP/3，库未编 QUIC 或网络不支持时由 libcurl 回落至 HTTP/2 / 1.1（HTTP/2 需编进 nghttp2） */
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_3);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR,
+                         url.rfind("https://", 0) == 0 ? "https" : "http,https");
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 20L);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);

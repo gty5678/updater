@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Updater (Windows)",
+      "request": "launch",
+      "type": "cppvsdbg",
+      "program": "${workspaceFolder}/build/windows-debug/Debug/updater.exe",
+      "args": [
+        "--help"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build updater (Windows)"
+    },
+    {
+      "name": "Updater (macOS)",
+      "request": "launch",
+      "type": "lldb",
+      "program": "${workspaceFolder}/build/macos-debug/updater",
+      "args": [
+        "--help"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build updater (macOS)"
+    },
+    {
+      "name": "Updater (Linux)",
+      "request": "launch",
+      "type": "cppdbg",
+      "program": "${workspaceFolder}/build/linux-debug/updater",
+      "args": [
+        "--help"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build updater (Linux)",
+      "MIMode": "gdb"
+    }
+  ]
+}

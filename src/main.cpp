@@ -1,5 +1,5 @@
 /**
- * DarkEye 更新器主程序
+ * 通用更新器主程序
  * 负责检查更新、下载安装包、解压覆盖、备份与回滚
  */
 #include "download.hpp"
@@ -9,8 +9,8 @@
 #include "tarzst_extract.hpp"
 #include "utils.hpp"
 #include "zip_extract.hpp"
-#include <algorithm>
-#include <limits>
+#include <cctype>
+#include <cstdint>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -18,29 +18,24 @@
 #endif
 #include <chrono>
 #include <iostream>
-#include <cstring>
 #include <set>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
 
-/// 默认的 latest.json 远程地址，用于获取最新版本信息
-const char* DEFAULT_LATEST_JSON_URL =
-    "https://raw.githubusercontent.com/de4321/darkeye/main/update/latest.json";
-
 /// 命令行参数与配置
 struct Args {
-    std::string latestJsonUrl = DEFAULT_LATEST_JSON_URL;  ///< latest.json 的 URL
-    std::string installDir = ".";                         ///< 应用安装目录
-    std::string mainExe = "DarkEye.exe";                  ///< 主程序可执行文件名
+    std::string latestJsonUrl;  ///< latest.json 的 URL
+    std::string installDir;                         ///< 应用安装目录
+    std::string mainExe;                  ///< 主程序可执行文件名
     std::string currentVersion;                           ///< 当前本地版本号
-    std::vector<std::string> keep = {"data"};             ///< 更新时保留的目录/文件列表
+    std::vector<std::string> keep;             ///< 更新时保留的目录/文件列表
     bool rollbackOnFailure = true;                        ///< 更新失败时是否回滚
     uint32_t pid = 0;                                     ///< 主进程 PID，用于等待其退出
     int waitTimeoutSeconds = 120;                        ///< 等待主进程退出的超时（秒）
@@ -51,6 +46,7 @@ struct Args {
     bool startMain = true;                                 ///< 更新完成后是否自动启动主程序
     std::string updaterDir = ".updater";                   ///< 更新器工作目录
     std::string backupDirName = ".updater_backup";         ///< 备份根目录名
+    std::string payloadRoot;
     std::string localPackage;                              ///< 非空则使用本地安装包，跳过远程与校验
 };
 
@@ -86,26 +82,10 @@ std::set<std::string> parseKeep(const std::vector<std::string>& keepList) {
     return result;
 }
 
-/// 检查是否以副本方式运行（--running-from-copy <路径>），若是则返回 true 并填充 outPath
-bool hasRunningFromCopy(int argc, char* argv[], std::string& outPath) {
-    outPath.clear();
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--running-from-copy" && i + 1 < argc) {
-            outPath = argv[i + 1];
-            return true;
-        }
-    }
-    return false;
-}
-
 /// 解析命令行参数，填充 args
 void parseArgs(int argc, char* argv[], Args& args) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--running-from-copy") {
-            if (i + 1 < argc) ++i;
-            continue;
-        }
         if (arg == "--latest-json-url" && i + 1 < argc) {
             args.latestJsonUrl = argv[++i];
         } else if (arg == "--install-dir" && i + 1 < argc) {
@@ -121,7 +101,12 @@ void parseArgs(int argc, char* argv[], Args& args) {
         } else if (arg == "--no-rollback-on-failure") {
             args.rollbackOnFailure = false;
         } else if (arg == "--pid" && i + 1 < argc) {
-            args.pid = static_cast<uint32_t>(std::stoul(argv[++i]));
+            const std::string value = argv[++i];
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos ||
+                std::stoull(value) > UINT32_MAX) {
+                throw std::runtime_error("Invalid PID: " + value);
+            }
+            args.pid = static_cast<uint32_t>(std::stoull(value));
         } else if (arg == "--wait-timeout-seconds" && i + 1 < argc) {
             args.waitTimeoutSeconds = std::stoi(argv[++i]);
         } else if (arg == "--download-timeout-seconds" && i + 1 < argc) {
@@ -140,8 +125,12 @@ void parseArgs(int argc, char* argv[], Args& args) {
             args.updaterDir = argv[++i];
         } else if (arg == "--backup-dir-name" && i + 1 < argc) {
             args.backupDirName = argv[++i];
+        } else if (arg == "--payload-root" && i + 1 < argc) {
+            args.payloadRoot = argv[++i];
         } else if (arg == "--local-package" && i + 1 < argc) {
             args.localPackage = argv[++i];
+        } else {
+            throw std::runtime_error("Unknown option or missing value: " + arg);
         }
     }
 }
@@ -161,15 +150,13 @@ std::string getTimestamp() {
     return oss.str();
 }
 
-/// 启动时欢迎横幅（仅在实际执行更新的进程中打印，复制自身后立即退出的实例不打印）
-void printWelcomeBanner() {
-    std::cout
-        << "\n"
-        << "  ============================================================\n"
-        << "       DarkEye 版本更新器\n"
-        << "       欢迎使用 — 即将检查更新并安装\n"
-        << "  ============================================================\n"
-        << "\n";
+void printHelp() {
+    std::cout << "updater --install-dir DIR [--main-exe PATH | --no-start-main]\n"
+                 "        (--latest-json-url URL --current-version VERSION | --local-package FILE)\n"
+                 "        [--keep NAME[,NAME...]] [--pid PID] [--main-args ARGS] [--payload-root PATH]\n"
+                 "        [--wait-timeout-seconds N] [--download-timeout-seconds N]\n"
+                 "        [--package-timeout-seconds N] [--download-retries N]\n"
+                 "        [--updater-dir NAME] [--backup-dir-name NAME] [--no-rollback-on-failure]\n";
 }
 
 }  // namespace
@@ -180,8 +167,9 @@ static std::string wideToUtf8MainArgv(const wchar_t* wide) {
     if (!wide || !*wide) return "";
     int size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
     if (size <= 0) return "";
-    std::string result(static_cast<size_t>(size - 1), '\0');
+    std::string result(static_cast<size_t>(size), '\0');
     WideCharToMultiByte(CP_UTF8, 0, wide, -1, result.data(), size, nullptr, nullptr);
+    result.pop_back();
     return result;
 }
 
@@ -227,11 +215,12 @@ int main(int argc, char* argv[]) {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    // 判断是否已从副本启动（避免覆盖正在运行的 exe）
-    std::string runningFromCopyPath;
-    bool isCopy = hasRunningFromCopy(argc, argv, runningFromCopyPath);
+    if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--help")) {
+        printHelp();
+        return 0;
+    }
 
-    // 最外层失败兜底清理（例如下载阶段超时抛异常时）
+    std::string lockPathToCleanup;
     std::string updaterDirPathToCleanup;
     std::string backupRootPathToCleanup;
 
@@ -239,25 +228,63 @@ int main(int argc, char* argv[]) {
         Args args;
         parseArgs(argc, argv, args);
 
-        std::filesystem::path appDir =
-            std::filesystem::absolute(std::filesystem::u8path(args.installDir));
-        std::filesystem::path updaterDir = appDir / std::filesystem::u8path(args.updaterDir);
-        std::filesystem::path backupRoot = appDir / std::filesystem::u8path(args.backupDirName);
-        updaterDirPathToCleanup = updaterDir.u8string();
-        backupRootPathToCleanup = backupRoot.u8string();
+        namespace fs = std::filesystem;
+        if (args.installDir.empty()) {
+            throw std::runtime_error("--install-dir is required");
+        }
+        if (args.localPackage.empty() && args.latestJsonUrl.empty()) {
+            throw std::runtime_error("--latest-json-url or --local-package is required");
+        }
 
-        // 若非副本运行，先复制自身到临时目录再以副本方式重新启动
-        if (!isCopy) {
-            std::string ts = getTimestamp();
-            std::filesystem::path copyPath = std::filesystem::temp_directory_path() / ("DarkEyeUpdater_" + ts + ".exe");
-            if (updater::copySelfAndLaunch(copyPath.u8string(), appDir.u8string(), argc, argv)) {
-                return 0;
+        const auto appDir = fs::canonical(fs::u8path(args.installDir));
+        if (!fs::is_directory(appDir) || appDir == appDir.root_path()) {
+            throw std::runtime_error("Install directory must be an existing application directory");
+        }
+
+        const auto self = fs::canonical(fs::u8path(updater::getCurrentExePath()));
+        for (auto parent = self.parent_path(); !parent.empty() && parent != parent.root_path();
+             parent = parent.parent_path()) {
+            if (fs::equivalent(parent, appDir)) {
+                throw std::runtime_error("Run updater from outside the installation directory");
             }
         }
 
-        printWelcomeBanner();
-
+        const auto workName = updater::safeRelativePath(fs::u8path(args.updaterDir));
+        const auto backupName = updater::safeRelativePath(fs::u8path(args.backupDirName));
+        if (workName == "." || backupName == "." || workName.has_parent_path() ||
+            backupName.has_parent_path() || workName == backupName) {
+            throw std::runtime_error("Work and backup directories must be distinct top-level names");
+        }
+        args.updaterDir = workName.u8string();
+        args.backupDirName = backupName.u8string();
+        const auto updaterDir = appDir / workName;
+        const auto backupRoot = appDir / backupName;
+        const auto mainPath = args.mainExe.empty() ? fs::path{} :
+            updater::safeRelativePath(fs::u8path(args.mainExe));
+        if (args.startMain && (mainPath.empty() || mainPath == ".")) {
+            throw std::runtime_error("--main-exe or --no-start-main is required");
+        }
+        if (args.waitTimeoutSeconds < 0 || args.waitTimeoutSeconds > 86400) {
+            throw std::runtime_error("--wait-timeout-seconds must be between 0 and 86400");
+        }
         auto keepUser = parseKeep(args.keep);
+        for (const auto& name : keepUser) {
+            if (name == "." || fs::u8path(name).has_parent_path() ||
+                updater::safeRelativePath(fs::u8path(name)) != fs::u8path(name)) {
+                throw std::runtime_error("--keep expects top-level names");
+            }
+        }
+
+        const auto lock = appDir / ".update-lock";
+        if (!fs::create_directory(lock)) {
+            throw std::runtime_error("Installation is locked: " + lock.u8string());
+        }
+        lockPathToCleanup = lock.u8string();
+
+        if (!fs::create_directory(updaterDir)) {
+            throw std::runtime_error("Updater work directory already exists: " + updaterDir.u8string());
+        }
+        updaterDirPathToCleanup = updaterDir.u8string();
 
         updater::log("Working in: " + appDir.u8string());
 
@@ -275,7 +302,6 @@ int main(int argc, char* argv[]) {
             }
             // 根据路径扩展名决定格式：.tar.zst 或 .zip（规则与 package_url 一致）
             packageExt = packageExtFromUrlOrPath(packagePath.u8string());
-            std::filesystem::create_directories(updaterDir);
             updater::log("Local package mode: " + packagePath.u8string());
             updater::log("Skipping remote version check and SHA256 verification.");
         } else {
@@ -293,7 +319,7 @@ int main(int argc, char* argv[]) {
                                                   args.downloadTimeoutSeconds,
                                                   args.downloadRetries);
             std::string jsonStr(rawJson.begin(), rawJson.end());
-            auto latest = updater::loadLatestInfo(jsonStr);
+            auto latest = updater::loadLatestInfo(jsonStr, UPDATER_PLATFORM);
             updater::log("Remote version: " + latest.latestVersion);
 
             // 比较版本号，若远程不比本地新则无需更新
@@ -311,7 +337,6 @@ int main(int argc, char* argv[]) {
                 goto exit_main;
             }
 
-            std::filesystem::create_directories(updaterDir);
 
             // 根据 package_url 扩展名决定格式：.tar.zst 或 .zip
             packageExt = packageExtFromUrlOrPath(latest.packageUrl);
@@ -330,6 +355,8 @@ int main(int argc, char* argv[]) {
             {
                 std::ofstream of(packagePath, std::ios::binary);
                 of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
+                of.close();
+                if (!of) throw std::runtime_error("Failed to save downloaded package");
             }
             updater::log("Downloaded update package: " + packagePath.u8string());
 
@@ -359,14 +386,15 @@ int main(int argc, char* argv[]) {
             updater::log("Waiting for main PID " + std::to_string(args.pid) + " to exit...");
             bool ok = updater::waitForPidExit(args.pid, args.waitTimeoutSeconds);
             if (!ok) {
-                updater::log("Main process still running after timeout. Continue anyway.");
+                throw std::runtime_error("Application is still running after timeout");
             }
-        } else {
-            updater::log("No PID provided; waiting 3 seconds for manual shutdown...");
-            std::this_thread::sleep_for(std::chrono::seconds(3));
         }
 
         // 创建带时间戳的备份目录并备份当前应用
+        if (!fs::create_directory(backupRoot)) {
+            throw std::runtime_error("Backup directory already exists: " + backupRoot.u8string());
+        }
+        backupRootPathToCleanup = backupRoot.u8string();
         std::string ts = getTimestamp();
         std::filesystem::path backupDir = backupRoot / ("backup_" + ts);
         updater::log("Backing up app to: " + backupDir.u8string());
@@ -378,8 +406,10 @@ int main(int argc, char* argv[]) {
         auto keepRelUpdate = keepUser;
         keepRelUpdate.insert(args.updaterDir);
         keepRelUpdate.insert(args.backupDirName);
+        keepRelUpdate.insert(".update-lock");
         auto keepRelRollback = keepRelUpdate;
 
+        bool installationStarted = false;
         try {
             // 解压到 .updater/unpacked（zip 或 tar.zst 根据格式自动选择）
             updater::log("Unpacking package...");
@@ -398,42 +428,39 @@ int main(int argc, char* argv[]) {
             updater::progressBarEnd();
 
             // 定位解压后的 payload 根目录（可能有一层包装目录）
-            std::string payloadRoot = updater::discoverExtractedPayload(unpackedDir.u8string());
-            updater::log("Payload root: " + payloadRoot);
-
-            // 将 payload 覆盖到应用目录，保留 keep 中的目录
-            updater::log("Overlay updating app/ (keep: ...)...");
-            updater::copyTreeOverlayWithKeep(payloadRoot, appDir.u8string(), keepRelUpdate);
-
-#ifdef _WIN32
-            // 更新完成后启动主程序
-            if (args.startMain) {
-                std::filesystem::path mainExePath = appDir / std::filesystem::u8path(args.mainExe);
-                if (!std::filesystem::exists(mainExePath)) {
-                    throw std::runtime_error("Cannot find main exe after update: " + mainExePath.u8string());
-                }
-                std::string mainArgs = updater::trim(args.mainArgs);
-                updater::log("Starting main: " + mainExePath.u8string() + (mainArgs.empty() ? "" : " ") + mainArgs);
-                if (!updater::startMainExe(mainExePath.u8string(), appDir.u8string(), mainArgs)) {
-                    updater::log("Failed to start main executable.");
-                }
-            } else {
-                updater::log("Skip starting main executable (--no-start-main).");
+            auto payloadRoot = unpackedDir;
+            if (!args.payloadRoot.empty()) {
+                payloadRoot /= updater::safeRelativePath(fs::u8path(args.payloadRoot));
+            } else if (!args.startMain || !fs::is_regular_file(unpackedDir / mainPath)) {
+                payloadRoot = fs::u8path(updater::discoverExtractedPayload(unpackedDir.u8string()));
             }
-#else
-            updater::log("Starting main not implemented on this platform.");
-#endif
+            updater::log("Payload root: " + payloadRoot.u8string());
 
-            // 清理临时目录：.updater 和 .updater_backup
-            updater::safeRemoveTree(updaterDir.u8string(), ".updater");
-            updater::safeRemoveTree(backupRoot.u8string(), ".updater_backup");
+            if (!fs::is_directory(payloadRoot) || fs::is_empty(payloadRoot)) {
+                throw std::runtime_error("Update payload is empty");
+            }
+            if (args.startMain && !fs::is_regular_file(payloadRoot / mainPath)) {
+                throw std::runtime_error("Launch executable missing in payload: " + args.mainExe);
+            }
+
+            installationStarted = true;
+            updater::copyTreeOverlayWithKeep(payloadRoot.u8string(), appDir.u8string(), keepRelUpdate);
+
+            if (args.startMain) {
+                const auto executable = appDir / mainPath;
+                if (!updater::startMainExe(executable.u8string(), appDir.u8string(), args.mainArgs)) {
+                    throw std::runtime_error("Failed to launch: " + executable.u8string());
+                }
+            }
 
             updater::log("Updater finished.");
             exitCode = 0;
         } catch (const std::exception& e) {
             // 更新失败：根据配置决定是否从备份回滚
             updater::log(std::string("Update failed: ") + e.what());
-            if (args.rollbackOnFailure) {
+            if (!installationStarted) {
+                exitCode = 1;
+            } else if (args.rollbackOnFailure) {
                 try {
                     updater::rollbackFromBackup(backupDir.u8string(), appDir.u8string(), keepRelRollback);
                     exitCode = 20;
@@ -445,38 +472,26 @@ int main(int argc, char* argv[]) {
                 exitCode = 22;
             }
 
-            // 失败回退完成后：从用户视角不应残留更新器临时目录
-            updater::safeRemoveTree(updaterDir.u8string(), ".updater");
-            updater::safeRemoveTree(backupRoot.u8string(), ".updater_backup");
+            if (exitCode == 21 || exitCode == 22) {
+                updater::log("Recovery backup retained: " + backupDir.u8string());
+                backupRootPathToCleanup.clear();
+            }
         }
-
-#ifdef _WIN32
-        // 若从副本运行，更新完成后安排删除临时副本 exe
-        if (isCopy && !runningFromCopyPath.empty()) {
-            updater::scheduleSelfDelete(runningFromCopyPath);
-        }
-#endif
     } catch (const std::exception& e) {
-        // 顶层异常：参数解析、复制自身等早期错误
         updater::log(std::string("Fatal error: ") + e.what());
         exitCode = 1;
-
-        // 下载阶段失败也要从用户视角保证不残留更新器目录
-        if (!updaterDirPathToCleanup.empty()) {
-            updater::safeRemoveTree(updaterDirPathToCleanup, ".updater");
-        }
-        if (!backupRootPathToCleanup.empty()) {
-            updater::safeRemoveTree(backupRootPathToCleanup, ".updater_backup");
-        }
     }
 
 exit_main:
-#ifdef _WIN32
-    // 成功或失败均暂停，便于查看完整日志
-    std::cout << "\n按回车键退出...";
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    std::cin.get();
-#endif
+    if (!backupRootPathToCleanup.empty()) {
+        updater::safeRemoveTree(backupRootPathToCleanup, "backup");
+    }
+    if (!updaterDirPathToCleanup.empty()) {
+        updater::safeRemoveTree(updaterDirPathToCleanup, "work directory");
+    }
 
+    if (!lockPathToCleanup.empty()) {
+        updater::safeRemoveTree(lockPathToCleanup, "installation lock");
+    }
     return exitCode;
 }

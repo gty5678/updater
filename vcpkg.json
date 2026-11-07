@@ -1,0 +1,11 @@
+{
+  "name": "updater",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "curl",
+    "miniz",
+    "nlohmann-json",
+    "picosha2",
+    "zstd"
+  ]
+}

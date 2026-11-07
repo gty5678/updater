@@ -1,10 +1,14 @@
 #pragma once
 
+#include <filesystem>
+
 #include <cstddef>
 #include <string>
 #include <vector>
 
 namespace updater {
+
+std::filesystem::path safeRelativePath(const std::filesystem::path& path);
 
 void log(const std::string& msg);
 

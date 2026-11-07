@@ -162,6 +162,7 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         throw std::runtime_error("Failed to open: " + tarzstPath);
     }
     std::streamsize fileSize = ifs.tellg();
+    if (fileSize <= 0) throw std::runtime_error("Empty or unreadable archive: " + tarzstPath);
     ifs.seekg(0);
     std::vector<uint8_t> compressed(static_cast<size_t>(fileSize));
     if (!ifs.read(reinterpret_cast<char*>(compressed.data()), fileSize)) {
@@ -185,6 +186,7 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         if (ZSTD_isError(result)) {
             throw std::runtime_error(std::string("Zstd decompress failed: ") + ZSTD_getErrorName(result));
         }
+        tarData.resize(result);
     } else {
         // Streaming decompression for unknown size
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
@@ -194,18 +196,21 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         const size_t bufSize = 1024 * 1024;  // 1MB chunks
         std::vector<uint8_t> outBuf(bufSize);
         ZSTD_inBuffer inBuf = {compressed.data(), compressedSize, 0};
+        size_t remaining = 1;
         while (inBuf.pos < inBuf.size) {
             ZSTD_outBuffer outBufStruct = {outBuf.data(), bufSize, 0};
-            size_t ret = ZSTD_decompressStream(dctx, &outBufStruct, &inBuf);
-            if (ZSTD_isError(ret)) {
+            remaining = ZSTD_decompressStream(dctx, &outBufStruct, &inBuf);
+            if (ZSTD_isError(remaining)) {
                 ZSTD_freeDCtx(dctx);
-                throw std::runtime_error(std::string("Zstd stream decompress failed: ") + ZSTD_getErrorName(ret));
+                throw std::runtime_error(std::string("Zstd stream decompress failed: ") + ZSTD_getErrorName(remaining));
             }
             tarData.insert(tarData.end(), outBuf.data(), outBuf.data() + outBufStruct.pos);
         }
         ZSTD_freeDCtx(dctx);
+        if (remaining != 0) throw std::runtime_error("Truncated zstd frame");
     }
 
+    if (tarData.size() < TAR_BLOCK_SIZE * 2) throw std::runtime_error("Invalid tar archive");
     const uint8_t* p = tarData.data();
     const uint8_t* end = tarData.data() + tarData.size();
     const size_t totalBytes = tarData.size();
@@ -217,11 +222,13 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
     std::optional<std::string> pendingPaxPath;
     std::optional<std::string> pendingGnuLongName;
 
-    while (p + TAR_BLOCK_SIZE * 2 <= end) {
+    bool reachedEnd = false;
+    while (static_cast<size_t>(end - p) >= TAR_BLOCK_SIZE * 2) {
         if (isZeroBlock(p)) {
             p += TAR_BLOCK_SIZE;
             if (p + TAR_BLOCK_SIZE <= end && isZeroBlock(p)) {
-                break;  // End of archive
+                reachedEnd = true;
+                break;
             }
             continue;
         }
@@ -229,14 +236,14 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         const auto* h = reinterpret_cast<const UstarHeader*>(p);
         size_t entrySize = parseOctal(h->size, 12);
         const char typeflag = h->typeflag;
+        const size_t dataBlocks = entrySize / TAR_BLOCK_SIZE + (entrySize % TAR_BLOCK_SIZE != 0);
+        if (dataBlocks > static_cast<size_t>(end - p) / TAR_BLOCK_SIZE - 1) {
+            throw std::runtime_error("Truncated tar entry");
+        }
 
         // PAX extended header (local 'x' / global 'g')
         if (typeflag == 'x' || typeflag == 'g') {
             const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
-            if (dataStart + entrySize > end) {
-                log("tar extract: truncated PAX extended header");
-                break;
-            }
             if (typeflag == 'x') {
                 // 多个连续 x 块会合并；仅当本块含 path= 时更新，避免后续无 path 的块清掉已有路径。
                 if (auto opt = parsePaxPathField(dataStart, entrySize)) {
@@ -255,10 +262,6 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         // GNU long name ('L') / long link ('K')
         if (typeflag == 'L' || typeflag == 'K') {
             const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
-            if (dataStart + entrySize > end) {
-                log("tar extract: truncated GNU long name/link");
-                break;
-            }
             if (typeflag == 'L') {
                 pendingGnuLongName = gnuLongNameFromData(dataStart, entrySize);
             }
@@ -294,46 +297,26 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
             continue;
         }
 
-        std::filesystem::path fullPath = destBase / std::filesystem::u8path(pathStr);
-        std::filesystem::path fullPathNorm = fullPath.lexically_normal();
+        std::replace(pathStr.begin(), pathStr.end(), '\\', '/');
+        const auto relative = safeRelativePath(std::filesystem::u8path(pathStr));
+        const auto destination = destBase / relative;
 
-        bool isDir = (typeflag == '5') ||
-                     (!pathStr.empty() && (pathStr.back() == '/' || pathStr.back() == '\\'));
-
-        if (isDir) {
-            try {
-                std::filesystem::create_directories(fullPathNorm);
-            } catch (const std::exception& e) {
-                log(std::string("tar extract: failed to create directory ") + fullPathNorm.u8string() + ": " +
-                    e.what());
-            }
+        if (typeflag == '5') {
+            std::filesystem::create_directories(destination);
         } else if (typeflag == '0' || typeflag == '\0') {
-            const uint8_t* dataStart = p + TAR_BLOCK_SIZE;
-            bool parentOk = false;
-            try {
-                std::filesystem::create_directories(fullPathNorm.parent_path());
-                parentOk = true;
-            } catch (const std::exception& e) {
-                log(std::string("tar extract: failed to create parent dir for ") + pathStr + ": " + e.what());
-            }
-            if (parentOk) {
-                if (dataStart + entrySize > end) {
-                    log("tar extract: truncated entry (data past archive end): " + pathStr);
-                } else {
-                    std::ofstream ofs(fullPathNorm, std::ios::binary);
-                    if (!ofs) {
-                        log(std::string("tar extract: failed to open for write: ") + fullPathNorm.u8string());
-                    } else {
-                        ofs.write(reinterpret_cast<const char*>(dataStart), static_cast<std::streamsize>(entrySize));
-                        ofs.flush();
-                        if (!ofs.good()) {
-                            log(std::string("tar extract: write failed: ") + fullPathNorm.u8string());
-                        }
-                    }
-                }
-            }
+            std::filesystem::create_directories(destination.parent_path());
+            std::ofstream out(destination, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(p + TAR_BLOCK_SIZE),
+                      static_cast<std::streamsize>(entrySize));
+            out.close();
+            if (!out) throw std::runtime_error("Failed to extract: " + pathStr);
+#ifndef _WIN32
+            std::filesystem::permissions(destination,
+                static_cast<std::filesystem::perms>(parseOctal(h->mode, sizeof(h->mode)) & 0777));
+#endif
+        } else {
+            throw std::runtime_error("Unsupported tar entry type: " + pathStr);
         }
-        // 其它类型（硬链接、符号链接、设备等）：跳过数据块，路径已由 pending* 消费。
 
         size_t blockCount = 1 + (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
         size_t bytesProcessed = static_cast<size_t>(p - tarData.data()) + blockCount * TAR_BLOCK_SIZE;
@@ -344,6 +327,7 @@ void extractTarZstToDir(const std::string& tarzstPath, const std::string& destDi
         p += TAR_BLOCK_SIZE + ((entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE;
     }
 
+    if (!reachedEnd) throw std::runtime_error("Missing tar end marker");
     if (onProgress && totalBytes > 0) {
         onProgress(totalBytes, totalBytes);  // 100% at end
     }

@@ -1,27 +1,34 @@
-cmake_minimum_required(VERSION 3.16)
-project(DarkEyeUpdater LANGUAGES CXX C)
+cmake_minimum_required(VERSION 3.25)
+project(Updater VERSION 1.0.0 LANGUAGES CXX)
+
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# MSVC: 使用 UTF-8 编码，避免日志乱码；静态链接运行时，生成无外部 DLL 依赖的单 exe
-if(MSVC)
-  add_compile_options(/utf-8)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+find_package(CURL CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(miniz CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
+find_package(Threads REQUIRED)
+find_path(PICOSHA2_INCLUDE_DIR NAMES picosha2.h REQUIRED)
+
+if(WIN32)
+    set(updater_os windows)
+elseif(APPLE)
+    set(updater_os macos)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(updater_os linux)
+else()
+    message(FATAL_ERROR "Unsupported target system: ${CMAKE_SYSTEM_NAME}")
 endif()
 
-# 依赖：全部使用 3rdparty 本地库
-# 3rdparty/
-#   picosha2/picosha2.h
-#   nlohmann_json/json.hpp
-#   miniz/miniz.h, miniz.c
-#   zstd/zstd.h, zstddeclib.c, zstd_errors.h
-#   curl/include/curl/*.h ，curl/lib/libcurl.lib（静态、/MT、Schannel 与工程一致）
-set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty)
-set(CURL_LIB "${THIRDPARTY_DIR}/curl/lib/libcurl.lib")
-if(NOT EXISTS "${CURL_LIB}")
-  message(FATAL_ERROR "缺少 libcurl：请将 libcurl.lib 放到 3rdparty/curl/lib/（与当前 MSVC /MT 一致）")
+if(VCPKG_TARGET_TRIPLET MATCHES "^(x64|arm64)-")
+    set(updater_arch "${CMAKE_MATCH_1}")
+else()
+    message(FATAL_ERROR "Use an x64 or arm64 vcpkg triplet")
 endif()
 
-add_executable(DarkEyeUpdater
+add_executable(updater
     src/main.cpp
     src/download.cpp
     src/json_parse.cpp
@@ -30,29 +37,19 @@ add_executable(DarkEyeUpdater
     src/fs_ops.cpp
     src/process.cpp
     src/utils.cpp
-    ${THIRDPARTY_DIR}/miniz/miniz.c
-    ${THIRDPARTY_DIR}/zstd/zstddeclib.c
+)
+target_include_directories(updater PRIVATE "${PICOSHA2_INCLUDE_DIR}")
+target_compile_definitions(updater PRIVATE UPDATER_PLATFORM="${updater_os}-${updater_arch}")
+target_link_libraries(updater PRIVATE
+    CURL::libcurl nlohmann_json::nlohmann_json miniz::miniz zstd::libzstd Threads::Threads
 )
 
-target_include_directories(DarkEyeUpdater PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRDPARTY_DIR}/picosha2
-    ${THIRDPARTY_DIR}/nlohmann_json
-    ${THIRDPARTY_DIR}/miniz
-    ${THIRDPARTY_DIR}/zstd
-    ${THIRDPARTY_DIR}/curl/include
-)
+if(MSVC)
+    set_property(TARGET updater PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(updater PRIVATE /utf-8)
+    target_link_libraries(updater PRIVATE shell32)
+elseif(updater_os STREQUAL "linux")
+    target_link_options(updater PRIVATE -static)
+endif()
 
-target_compile_definitions(DarkEyeUpdater PRIVATE CURL_STATICLIB)
-
-target_link_libraries(DarkEyeUpdater PRIVATE
-    "${CURL_LIB}"
-    ws2_32
-    crypt32
-    advapi32
-    normaliz
-    secur32
-    bcrypt
-    iphlpapi
-    shell32
-)
+install(TARGETS updater RUNTIME DESTINATION .)

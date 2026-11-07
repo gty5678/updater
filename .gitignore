@@ -4,7 +4,10 @@ Thumbs.db
 Desktop.ini
 
 # Editor / IDE
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
 .idea/
 *.suo
 *.user
@@ -53,3 +56,5 @@ coverage/
 .coverage
 htmlcov/
 darkeye/
+/vcpkg_installed/
+/CMakeUserPresets.json

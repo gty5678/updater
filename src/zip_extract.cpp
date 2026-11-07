@@ -1,6 +1,7 @@
 #include "zip_extract.hpp"
 #include "utils.hpp"
 #include "miniz.h"
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -82,6 +83,11 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
         throw std::runtime_error("Failed to open zip: " + zipPath);
     }
 
+    struct ZipReaderGuard {
+        mz_zip_archive& archive;
+        ~ZipReaderGuard() { mz_zip_reader_end(&archive); }
+    } guard{zip};
+
     mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
     std::filesystem::path destBase = std::filesystem::u8path(destDir);
 
@@ -91,16 +97,20 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
         }
         mz_zip_archive_file_stat stat{};
         if (!mz_zip_reader_file_stat(&zip, i, &stat)) {
-            mz_zip_reader_end(&zip);
             throw std::runtime_error("Failed to get file stat in zip");
         }
 
         std::string filename = stat.m_filename;
         if (filename.empty()) continue;
 
-        std::filesystem::path filenamePath = zipEntryFilenameToPath(filename, stat.m_bit_flag);
-        std::filesystem::path destPath = destBase / filenamePath;
-        std::filesystem::path destPathNorm = std::filesystem::path(destPath).lexically_normal();
+        std::replace(filename.begin(), filename.end(), '\\', '/');
+        const auto destPathNorm = destBase / safeRelativePath(zipEntryFilenameToPath(filename, stat.m_bit_flag));
+        const bool unixAttributes = (stat.m_version_made_by >> 8) == 3;
+        const auto mode = stat.m_external_attr >> 16;
+        const auto fileType = mode & 0170000;
+        if (unixAttributes && fileType != 0 && fileType != 0100000 && fileType != 0040000) {
+            throw std::runtime_error("Unsupported ZIP entry type: " + filename);
+        }
 
         bool isDir = mz_zip_reader_is_file_a_directory(&zip, i) ||
                      (!filename.empty() && (filename.back() == '/' || filename.back() == '\\'));
@@ -110,13 +120,19 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
             std::filesystem::create_directories(destPathNorm.parent_path());
             std::ofstream out(destPathNorm, std::ios::binary);
             if (!out) {
-                mz_zip_reader_end(&zip);
                 throw std::runtime_error("Failed to extract: " + filename);
             }
             if (!mz_zip_reader_extract_to_callback(&zip, i, zipWriteToOfstream, &out, 0)) {
-                mz_zip_reader_end(&zip);
                 throw std::runtime_error("Failed to extract: " + filename);
             }
+            out.close();
+            if (!out) throw std::runtime_error("Failed to write: " + filename);
+#ifndef _WIN32
+            if (unixAttributes && (mode & 0777)) {
+                std::filesystem::permissions(destPathNorm,
+                    static_cast<std::filesystem::perms>(mode & 0777));
+            }
+#endif
         }
     }
 
@@ -124,7 +140,6 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
         onProgress(static_cast<size_t>(numFiles), static_cast<size_t>(numFiles));
     }
 
-    mz_zip_reader_end(&zip);
 }
 
 std::string discoverExtractedPayload(const std::string& unpackedDir) {

@@ -11,6 +11,6 @@ struct LatestInfo {
     std::string packageSha256;
 };
 
-LatestInfo loadLatestInfo(const std::string& jsonContent);
+LatestInfo loadLatestInfo(const std::string& jsonContent, const std::string& platform);
 
 }  // namespace updater

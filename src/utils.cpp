@@ -10,6 +10,25 @@
 
 namespace updater {
 
+std::filesystem::path safeRelativePath(const std::filesystem::path& path) {
+    if (path.empty() || path.has_root_path()) {
+        throw std::runtime_error("Expected a relative path: " + path.u8string());
+    }
+    for (const auto& part : path) {
+        const auto name = part.u8string();
+        if (part == ".." || name.find_first_of(":\\") != std::string::npos) {
+            throw std::runtime_error("Unsafe relative path: " + path.u8string());
+        }
+#ifdef _WIN32
+        if (!name.empty() && part != "." && (name.back() == '.' || name.back() == ' ')) {
+            throw std::runtime_error("Unsafe Windows path: " + path.u8string());
+        }
+#endif
+    }
+    return path.lexically_normal();
+}
+
+
 void log(const std::string& msg) {
     std::cout << "[updater] " << msg << std::endl;
 }
