@@ -83,28 +83,31 @@ void copyTreeOverlayWithKeep(const std::string& srcRoot,
     std::filesystem::path dest = std::filesystem::u8path(destRoot);
     std::filesystem::path src = std::filesystem::u8path(srcRoot);
 
-    for (const auto& item : std::filesystem::directory_iterator(dest)) {
-        std::string rel = item.path().filename().u8string();
-        std::replace(rel.begin(), rel.end(), '\\', '/');
-        if (isKeptName(rel, keepRel)) continue;
-
-        runFsWithRetry("Remove during overlay: " + item.path().u8string(), [&item]() {
-            std::filesystem::remove_all(item.path());
-        });
-    }
-
-    for (const auto& item : std::filesystem::directory_iterator(src)) {
-        std::string rel = std::filesystem::relative(item.path(), src).u8string();
-        std::replace(rel.begin(), rel.end(), '\\', '/');
-        if (isKeptName(rel, keepRel)) continue;
-
-        std::filesystem::path dstPath = dest / item.path().filename();
-        runFsWithRetry("Copy during overlay: " + item.path().u8string() + " -> " + dstPath.u8string(), [&item, &dstPath]() {
-            std::filesystem::copy(item.path(), dstPath,
-                std::filesystem::copy_options::recursive |
+    // Overlay only entries provided by the package. Never follow destination
+    // symlinks while writing, and retain files absent from the new payload.
+    std::function<void(const std::filesystem::path&, const std::filesystem::path&)> overlay;
+    overlay = [&](const auto& source, const auto& target) {
+        const auto status = std::filesystem::symlink_status(source);
+        const auto targetStatus = std::filesystem::symlink_status(target);
+        if (std::filesystem::is_directory(status)) {
+            if (!std::filesystem::is_directory(targetStatus)) {
+                std::filesystem::remove_all(target);
+                std::filesystem::create_directories(target);
+            }
+            for (const auto& child : std::filesystem::directory_iterator(source))
+                overlay(child.path(), target / child.path().filename());
+            std::filesystem::permissions(target, status.permissions());
+        } else {
+            std::filesystem::remove_all(target);
+            std::filesystem::copy(source, target,
                 std::filesystem::copy_options::copy_symlinks |
                 std::filesystem::copy_options::overwrite_existing);
-        });
+        }
+    };
+    for (const auto& item : std::filesystem::directory_iterator(src)) {
+        if (isKeptName(item.path().filename().u8string(), keepRel)) continue;
+        const auto target = dest / item.path().filename();
+        runFsWithRetry("Overlay: " + target.u8string(), [&] { overlay(item.path(), target); });
     }
 }
 
@@ -142,6 +145,11 @@ void rollbackFromBackup(const std::string& backupDir,
     }
     if (!std::filesystem::is_directory(backup)) {
         throw std::runtime_error("Backup path is not a directory: " + backupDir);
+    }
+    // Rollback restores the exact snapshot, including removal of new files.
+    for (const auto& item : std::filesystem::directory_iterator(std::filesystem::u8path(appDir))) {
+        if (!isKeptName(item.path().filename().u8string(), keepRel))
+            std::filesystem::remove_all(item.path());
     }
     copyTreeOverlayWithKeep(backupDir, appDir, keepRel);
     log("Rollback: completed.");

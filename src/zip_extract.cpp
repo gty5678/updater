@@ -91,6 +91,7 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
     mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
     std::filesystem::path destBase = std::filesystem::u8path(destDir);
 
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> links;
     for (mz_uint i = 0; i < numFiles; ++i) {
         if (onProgress) {
             onProgress(static_cast<size_t>(i), static_cast<size_t>(numFiles));
@@ -108,8 +109,25 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
         const bool unixAttributes = (stat.m_version_made_by >> 8) == 3;
         const auto mode = stat.m_external_attr >> 16;
         const auto fileType = mode & 0170000;
-        if (unixAttributes && fileType != 0 && fileType != 0100000 && fileType != 0040000) {
+        if (unixAttributes && fileType != 0 && fileType != 0100000 && fileType != 0040000 && fileType != 0120000) {
             throw std::runtime_error("Unsupported ZIP entry type: " + filename);
+        }
+
+        if (unixAttributes && fileType == 0120000) {
+            size_t size = 0;
+            void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
+            if (!data || size == 0 || size > 4096) {
+                mz_free(data);
+                throw std::runtime_error("Invalid ZIP symlink");
+            }
+            std::string text(static_cast<const char*>(data), size);
+            mz_free(data);
+            const auto target = std::filesystem::u8path(text);
+            if (target.is_absolute() || text.find('\0') != std::string::npos)
+                throw std::runtime_error("Unsafe ZIP symlink");
+            safeRelativePath((destPathNorm.parent_path().lexically_relative(destBase) / target).lexically_normal());
+            links.emplace_back(destPathNorm, target);
+            continue;
         }
 
         bool isDir = mz_zip_reader_is_file_a_directory(&zip, i) ||
@@ -134,6 +152,20 @@ void extractZipToDir(const std::string& zipPath, const std::string& destDir,
             }
 #endif
         }
+    }
+
+    // Links are installed last, so archive entries cannot write through them.
+    for (const auto& link : links) {
+        const auto resolved = std::filesystem::weakly_canonical(link.first.parent_path() / link.second);
+        const auto relative = resolved.lexically_relative(std::filesystem::weakly_canonical(destBase));
+        safeRelativePath(relative);
+        for (auto parent = link.first.parent_path(); parent != destBase && !parent.empty(); parent = parent.parent_path())
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(parent)))
+                throw std::runtime_error("ZIP symlink parent is a link");
+        std::filesystem::create_directories(link.first.parent_path());
+        if (std::filesystem::exists(std::filesystem::symlink_status(link.first)))
+            throw std::runtime_error("Duplicate ZIP symlink path");
+        std::filesystem::create_symlink(link.second, link.first);
     }
 
     if (onProgress) {

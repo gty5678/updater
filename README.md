@@ -65,6 +65,18 @@ cmake -E chdir build/demo-payload cmake -E tar cf ../demo.zip --format=zip -- ve
 | macOS | `bash scripts/package-macos.sh` | `dist/macos-x64/updater` 或 `dist/macos-arm64/updater` |
 | Linux | `bash scripts/package-linux.sh` | `dist/linux-x64/updater` 或 `dist/linux-arm64/updater` |
 
+macOS 首次构建（Apple Silicon 和 Intel 均支持）：
+
+```sh
+xcode-select --install  # 已安装 Xcode / Command Line Tools 时跳过
+brew install cmake ninja pkg-config
+git clone --branch 2026.10.16 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+bash scripts/package-macos.sh "$HOME/vcpkg"
+```
+
+macOS 脚本也会查找 `VCPKG_ROOT`、仓库内的 `vcpkg`、`~/vcpkg` 和 `~/.local/share/vcpkg` 等常见位置。按当前运行架构选择 `arm64-osx` 或 `x64-osx`，将构建缓存隔离到 `build/macos-release-<架构>`。只生成 `dist/macos-<架构>/updater` 单个可执行文件，直接运行该文件并传入 `--help` 可验证启动。它是供应用调用的命令行程序。构建后可运行 `python3 scripts/test-macos.py`，在临时目录验证安装、权限、启动、保留数据、失败回滚，以及在线下载、重定向、重试和超时。
+
 Windows 打包脚本会自动查找 PATH 中的 vcpkg、仓库内的 `vcpkg`、用户目录下的 `vcpkg`，以及系统盘的 `src/vcpkg` 和 `vcpkg`。也可显式指定：
 
 ```powershell
@@ -73,11 +85,11 @@ Windows 打包脚本会自动查找 PATH 中的 vcpkg、仓库内的 `vcpkg`、�
 
 显式参数或环境变量指向的目录必须包含 `vcpkg.exe` 和 CMake toolchain，系统还需提供 Git 命令。脚本也会自动查找 Visual Studio 随附的 CMake 和 Ninja，并通过 `VCPKG_FORCE_SYSTEM_BINARIES` 让 vcpkg 使用本机工具。依赖注册表固定在 `vcpkg-configuration.json` 指定的版本，vcpkg 会自动获取对应的版本数据库。VS Code 直接运行 CMake preset 时仍需配置 `VCPKG_ROOT`。
 
-vcpkg 提供的第三方库静态链接进产物。Windows 使用静态 MSVC 运行库 `/MT`，脚本用 `dumpbin` 检查导入表，运行时使用 Windows 系统 DLL。Linux 使用 `-static`，脚本通过 `readelf` 检查 ELF 的动态依赖和解释器。macOS 使用系统运行库和系统框架，脚本用 `otool` 检查动态依赖。Intel 和 Apple Silicon 分别构建。macOS 发布所需的签名与公证应在构建之后按发行渠道处理。HTTPS 验证依赖目标系统可用的信任证书。
+vcpkg 提供的第三方库静态链接进产物。Windows 使用静态 MSVC 运行库 `/MT`，脚本用 `dumpbin` 检查导入表，运行时使用 Windows 系统 DLL。Linux 使用 `-static`，脚本通过 `readelf` 检查 ELF 的动态依赖和解释器。macOS 下载使用系统 Foundation 的 `NSURLSession`，通过系统信任证书验证 HTTPS，不构建或链接 curl / OpenSSL；解压等第三方库仍静态链接。脚本用 `otool` 检查动态依赖。Intel 和 Apple Silicon 分别构建。macOS 发布所需的签名与公证应在构建之后按发行渠道处理。HTTPS 验证依赖目标系统可用的信任证书。
 
 ## 应用接入
 
-更新器放在应用安装目录之外。安装目录必须已存在，并且只包含这个应用的文件。更新包提供完整的新版本，旧版本中未通过 `--keep` 指定的内容会被替换。
+更新器放在应用安装目录之外。安装目录必须已存在，并且只包含这个应用的文件。更新包提供完整的新版本，更新包内文件递归覆盖，包外文件保留；`--keep` 指定的顶层文件或目录即使包内存在也不覆盖。
 
 本地安装包示例：
 
@@ -125,7 +137,7 @@ Windows 将启动入口改为相应的 `.exe`。macOS 可以指定如 `Demo.app/
 }
 ```
 
-清单还可包含 `macos-x64` 和 `linux-arm64`。旧式顶层 `package: { "url": "...", "sha256": "..." }` 可继续读取。旧格式兼容缺省校验值，`packages` 中每个平台的包都必须提供 SHA-256。
+清单还可包含 `macos-x64` 和 `linux-arm64`。不再接受旧式顶层 `package`，`packages` 中每个平台的包都必须提供 SHA-256。
 
 ## 失败与恢复
 

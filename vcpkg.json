@@ -2,7 +2,10 @@
   "name": "updater",
   "version-string": "1.0.0",
   "dependencies": [
-    "curl",
+    {
+      "name": "curl",
+      "platform": "!osx"
+    },
     "miniz",
     "nlohmann-json",
     "picosha2",
