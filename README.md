@@ -2,6 +2,8 @@
 
 `updater` 用于更新 Windows、macOS 和 Linux 上以独立目录交付的应用。调用方提供安装目录、更新源和可选的启动入口。同一个更新器可以服务多个应用。
 
+全部命令行参数、默认值、组合规则和调用示例见 [命令行参数文档](docs/CLI.md)。
+
 ## 构建环境
 
 所有平台都需要 Git、CMake 3.25 或更高版本，以及已 bootstrap 的 vcpkg。建议在仓库外检出与 [vcpkg-configuration.json](vcpkg-configuration.json) 基线对应的 vcpkg 标签 `2026.10.16`。
