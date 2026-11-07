@@ -2,6 +2,8 @@
 
 `updater` 用于更新 Windows、macOS 和 Linux 上以独立目录交付的应用。调用方提供安装目录、更新源和可选的启动入口。同一个更新器可以服务多个应用。
 
+全部命令行参数、默认值、组合规则和调用示例见 [命令行参数文档](docs/CLI.md)。
+
 ## 构建环境
 
 所有平台都需要 Git、CMake 3.25 或更高版本，以及已 bootstrap 的 vcpkg。建议在仓库外检出与 [vcpkg-configuration.json](vcpkg-configuration.json) 基线对应的 vcpkg 标签 `2026.10.16`。
@@ -86,6 +88,20 @@ Windows 打包脚本会自动查找 PATH 中的 vcpkg、仓库内的 `vcpkg`、�
 显式参数或环境变量指向的目录必须包含 `vcpkg.exe` 和 CMake toolchain，系统还需提供 Git 命令。脚本也会自动查找 Visual Studio 随附的 CMake 和 Ninja，并通过 `VCPKG_FORCE_SYSTEM_BINARIES` 让 vcpkg 使用本机工具。依赖注册表固定在 `vcpkg-configuration.json` 指定的版本，vcpkg 会自动获取对应的版本数据库。VS Code 直接运行 CMake preset 时仍需配置 `VCPKG_ROOT`。
 
 vcpkg 提供的第三方库静态链接进产物。Windows 使用静态 MSVC 运行库 `/MT`，脚本用 `dumpbin` 检查导入表，运行时使用 Windows 系统 DLL。Linux 使用 `-static`，脚本通过 `readelf` 检查 ELF 的动态依赖和解释器。macOS 下载使用系统 Foundation 的 `NSURLSession`，通过系统信任证书验证 HTTPS，不构建或链接 curl / OpenSSL；解压等第三方库仍静态链接。脚本用 `otool` 检查动态依赖。Intel 和 Apple Silicon 分别构建。macOS 发布所需的签名与公证应在构建之后按发行渠道处理。HTTPS 验证依赖目标系统可用的信任证书。
+
+## 自动更新测试
+
+构建完成后，在仓库根目录使用 Python 3 运行集成测试，无需安装 Python 第三方依赖：
+
+```powershell
+python tests/test_updates.py
+```
+
+默认测试 `dist/windows-x64/updater.exe`。测试其他构建时，可先设置 `UPDATER_EXE` 环境变量为更新器的绝对路径。
+
+测试自动在 `build/integration-tests` 中生成隔离的旧版应用和新版 ZIP，结束后清理。在线场景使用本机回环 HTTP 服务，无需外部更新源。12 个用例覆盖完整替换、旧文件清理、保留用户数据、包根目录识别、在线下载与 SHA-256 校验、同版本跳过、包损坏与路径越界拒绝、安装锁，以及启动失败回滚。测试核对退出码、文件内容和工作目录清理情况。
+
+当前用例使用 ZIP；tar.zst、真实应用启动和各目标平台仍需单独验证。
 
 ## 应用接入
 
