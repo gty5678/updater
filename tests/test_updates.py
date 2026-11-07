@@ -97,30 +97,32 @@ class UpdateTests(unittest.TestCase):
         return ('--latest-json-url', base + '/latest.json', '--current-version', '1.0.0',
                 '--download-retries', '1')
 
-    def test_local_full_replacement(self):
+    def test_local_overlay_preserves_unpacked_files(self):
         self.run_update('--local-package', self.package())
-        self.assertEqual(self.snapshot(), {'version.txt': b'2.0.0', 'assets/new.txt': b'new asset'})
+        self.assertEqual(self.snapshot(), {**self.before, 'version.txt': b'2.0.0',
+                                          'assets/new.txt': b'new asset'})
 
     def test_keep_user_data_over_package_defaults(self):
         package = self.package({'version.txt': '2.0.0', 'data/user.txt': 'default',
                                 'settings.json': 'default'})
         self.run_update('--local-package', package, '--keep', 'data', '--keep', 'settings.json')
-        self.assertEqual(self.snapshot(), {'version.txt': b'2.0.0',
+        self.assertEqual(self.snapshot(), {**self.before, 'version.txt': b'2.0.0',
                                           'data/user.txt': b'user data',
                                           'settings.json': b'user settings'})
 
     def test_auto_wrapper_directory(self):
         self.run_update('--local-package', self.package({'release/version.txt': '2.0.0'}))
-        self.assertEqual(self.snapshot(), {'version.txt': b'2.0.0'})
+        self.assertEqual(self.snapshot(), {**self.before, 'version.txt': b'2.0.0'})
 
     def test_explicit_root_preserves_single_directory(self):
         self.run_update('--local-package', self.package({'assets/new.txt': 'asset'}),
                         '--payload-root', '.')
-        self.assertEqual(self.snapshot(), {'assets/new.txt': b'asset'})
+        self.assertEqual(self.snapshot(), {**self.before, 'assets/new.txt': b'asset'})
 
     def test_online_update_with_sha256(self):
         self.run_update(*self.manifest())
-        self.assertEqual(self.snapshot(), {'version.txt': b'2.0.0', 'assets/new.txt': b'new asset'})
+        self.assertEqual(self.snapshot(), {**self.before, 'version.txt': b'2.0.0',
+                                          'assets/new.txt': b'new asset'})
 
     def test_same_version_skips_update(self):
         output = self.run_update(*self.manifest(version='1.0.0'))
