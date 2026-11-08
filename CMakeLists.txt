@@ -57,6 +57,7 @@ endif()
 
 add_executable(updater
     src/main.cpp
+    src/resume.cpp
     ${updater_download_source}
     src/json_parse.cpp
     src/zip_extract.cpp
@@ -81,7 +82,7 @@ endif()
 if(MSVC)
     set_property(TARGET updater PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(updater PRIVATE /utf-8)
-    target_link_libraries(updater PRIVATE shell32)
+    target_link_libraries(updater PRIVATE shell32 user32)
 elseif(updater_os STREQUAL "linux")
     target_link_options(updater PRIVATE -static)
 endif()

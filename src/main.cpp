@@ -11,6 +11,8 @@
 #include "zip_extract.hpp"
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -26,6 +28,114 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef __APPLE__
+#include <cerrno>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+// Keep updating in the original process so callers still receive its exit code.
+// Terminal only displays the log. Retain logs so failures remain diagnosable.
+class UpdateTerminal {
+    std::filesystem::path directory;
+    bool launched = false;
+    int result = 1;
+public:
+    void setResult(int code) { result = code; }
+    const std::filesystem::path& path() const { return directory; }
+    static bool reopen(const std::filesystem::path& lock) {
+        if (const auto quiet = std::getenv("UPDATER_NO_CONSOLE"); quiet && std::string(quiet) == "1") return false;
+        std::ifstream owner(lock / "console");
+        long pid = 0;
+        std::string directory;
+        if (!(owner >> pid) || pid <= 0) return false;
+        owner.ignore();
+        std::getline(owner, directory);
+        if (kill(static_cast<pid_t>(pid), 0) != 0) return false;
+        const auto script = std::filesystem::path(directory) / "正在更新.command";
+        if (!std::filesystem::is_regular_file(script)) return false;
+        const auto child = fork();
+        if (child == 0) {
+            execl("/usr/bin/open", "open", "-b", "com.apple.Terminal", script.c_str(), nullptr);
+            _exit(127);
+        }
+        int status = 0;
+        pid_t waited;
+        do { waited = child > 0 ? waitpid(child, &status, 0) : -1; }
+        while (waited < 0 && errno == EINTR);
+        return waited > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    void show() {
+        if (const auto quiet = std::getenv("UPDATER_NO_CONSOLE"); quiet && std::string(quiet) == "1") return;
+        if (isatty(STDOUT_FILENO)) {
+            std::cout << "\033]0;Updater - 正在更新，请勿关闭窗口\007";
+            return;
+        }
+        auto pattern = (std::filesystem::temp_directory_path() / "updater-console-XXXXXX").string();
+        if (!mkdtemp(pattern.data())) throw std::runtime_error("Cannot create update console directory");
+        directory = pattern;
+        const auto log = directory / "update.log";
+        const auto script = directory / "正在更新.command";
+        std::ofstream(log).close();
+        // mkdtemp's path is generated locally, but quote it for shell metacharacters.
+        auto quote = [](const std::string& value) {
+            std::string result = "'";
+            for (char c : value) result += c == '\'' ? "'\\''" : std::string(1, c);
+            return result + "'";
+        };
+        std::ofstream command(script);
+        command << "#!/bin/sh\ncd " << quote(directory.string()) << " || exit 1\n"
+                << "printf '\\033]0;Updater - 正在更新，请勿关闭窗口\\007'\n"
+                << "tail -n +1 -f update.log &\nviewer=$!\n"
+                << "trap 'kill \"$viewer\" 2>/dev/null' EXIT\n"
+                << "while [ ! -f done ]; do sleep 1; done\n"
+                << "sleep 1\nkill \"$viewer\" 2>/dev/null\nwait \"$viewer\" 2>/dev/null\n"
+                << "trap - EXIT\n"
+                << "code=$(cat done)\n"
+                << "case \"$code\" in\n"
+                << "0) printf '\\n更新流程已完成。\\n' ;;\n"
+                << "12) printf '\\n已有更新或安装锁，请查看上方说明。\\n' ;;\n"
+                << "20) printf '\\n更新失败，已恢复原版本。\\n' ;;\n"
+                << "*) printf '\\n更新未完成（退出码 %s），请查看上方错误和日志。\\n' \"$code\" ;;\nesac\n"
+                << "printf '更新日志：%s\\n' " << quote(log.string()) << "\n";
+        command.close();
+        if (!command || chmod(script.c_str(), 0700) != 0)
+            throw std::runtime_error("Cannot prepare update console");
+        const auto child = fork();
+        if (child == 0) {
+            execl("/usr/bin/open", "open", "-b", "com.apple.Terminal", script.c_str(), nullptr);
+            _exit(127);
+        }
+        int status = 0;
+        pid_t waited;
+        do { waited = child > 0 ? waitpid(child, &status, 0) : -1; }
+        while (waited == -1 && errno == EINTR);
+        if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            throw std::runtime_error("Cannot open update terminal");
+        launched = true;
+        if (!std::freopen(log.c_str(), "a", stdout) || !std::freopen(log.c_str(), "a", stderr))
+            throw std::runtime_error("Cannot open update console log");
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+    ~UpdateTerminal() {
+        if (!directory.empty()) {
+            if (!launched) {
+                std::error_code ignored;
+                std::filesystem::remove_all(directory, ignored);
+                return;
+            }
+            std::cout.flush();
+            std::cerr.flush();
+            std::ofstream(directory / "done") << result << '\n';
+        }
+    }
+};
+#endif
 
 namespace {
 
@@ -162,6 +272,23 @@ void printHelp() {
 }  // namespace
 
 #ifdef _WIN32
+static void showUpdateConsole() {
+    // A caller may launch us with CREATE_NO_WINDOW or a hidden console.
+    // Allocate a console if needed, then reconnect output for progress/logs.
+    if (!GetConsoleWindow() && AllocConsole()) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+        std::cout.clear();
+        std::cerr.clear();
+    }
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    SetConsoleTitleW(L"Updater - 正在更新，请勿关闭窗口");
+    if (const auto window = GetConsoleWindow()) {
+        ShowWindow(window, SW_SHOW);
+    }
+}
+
 /// Windows 下 argv 为系统 ANSI，与内部 UTF-8 路径不一致；从 Unicode 命令行解析为 UTF-8
 static std::string wideToUtf8MainArgv(const wchar_t* wide) {
     if (!wide || !*wide) return "";
@@ -198,7 +325,7 @@ static bool replaceArgvWithUtf8FromCommandLine(Utf8ArgvHolder& out) {
 
 int main(int argc, char* argv[]) {
     // 退出码：0=成功/无需更新, 1=致命错误, 2=package_url 为空, 3=SHA256 校验失败,
-    //        10=缺少 --current-version, 11=本地安装包路径无效,
+    //        10=缺少 --current-version, 11=本地安装包路径无效, 12=安装目录已锁定,
     //        20=更新失败已回滚, 21=回滚失败, 22=更新失败未回滚
     int exitCode = 0;
 #ifdef _WIN32
@@ -220,6 +347,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+#ifdef _WIN32
+    showUpdateConsole();
+#endif
+#ifdef __APPLE__
+    UpdateTerminal terminal;
+#endif
     std::string lockPathToCleanup;
     std::string updaterDirPathToCleanup;
     std::string backupRootPathToCleanup;
@@ -277,9 +410,29 @@ int main(int argc, char* argv[]) {
 
         const auto lock = appDir / ".update-lock";
         if (!fs::create_directory(lock)) {
-            throw std::runtime_error("Installation is locked: " + lock.u8string());
+#ifdef __APPLE__
+            if (UpdateTerminal::reopen(lock)) {
+                updater::log("更新正在进行，已打开当前任务的进度窗口，请勿重复更新。");
+                return 12;
+            }
+            terminal.show();
+#endif
+            updater::log("安装目录已锁定：可能已有更新正在运行，或上次更新异常中断。请先检查原进度窗口；确认更新器退出后再检查备份和遗留锁。");
+            updater::log("锁目录：" + lock.u8string());
+#ifdef __APPLE__
+            terminal.setResult(12);
+#endif
+            return 12;
         }
         lockPathToCleanup = lock.u8string();
+#ifdef __APPLE__
+        terminal.show();
+        if (!terminal.path().empty()) {
+            std::ofstream owner(lock / "console");
+            owner << getpid() << '\n' << terminal.path().string() << '\n';
+        }
+#endif
+        updater::log("更新正在进行，请等待完成。关闭进度窗口不会取消后台更新，请勿重复启动。");
 
         if (!fs::create_directory(updaterDir)) {
             throw std::runtime_error("Updater work directory already exists: " + updaterDir.u8string());
@@ -340,11 +493,15 @@ int main(int argc, char* argv[]) {
 
             // 根据 package_url 扩展名决定格式：.tar.zst 或 .zip
             packageExt = packageExtFromUrlOrPath(latest.packageUrl);
-            packagePath = updaterDir / ("update" + packageExt);
+            packagePath = fs::u8path(updater::downloadCachePath(appDir.u8string(), latest.packageUrl,
+                                                              latest.packageSha256));
+            updater::log("Package download cache (retained on interruption): " + packagePath.u8string());
 
             // 下载更新包，带进度条
-            auto packed = updater::downloadBytes(
+            updater::downloadFile(
                 latest.packageUrl,
+                packagePath.u8string(),
+                latest.packageSha256,
                 args.packageTimeoutSeconds,
                 args.downloadRetries,
                 [](size_t downloaded, size_t total) {
@@ -352,12 +509,6 @@ int main(int argc, char* argv[]) {
                     updater::printProgressBar("Download", pct, downloaded, total, false);
                 });
             updater::progressBarEnd();
-            {
-                std::ofstream of(packagePath, std::ios::binary);
-                of.write(reinterpret_cast<const char*>(packed.data()), packed.size());
-                of.close();
-                if (!of) throw std::runtime_error("Failed to save downloaded package");
-            }
             updater::log("Downloaded update package: " + packagePath.u8string());
 
             // 若提供了 SHA256，则校验下载文件的完整性
@@ -372,6 +523,8 @@ int main(int argc, char* argv[]) {
                 }
                 if (got != exp) {
                     updater::log("SHA256 mismatch. expected=" + exp + " got=" + got);
+                    fs::remove(packagePath);
+                    fs::remove(fs::u8path(packagePath.u8string() + ".json"));
                     exitCode = 3;
                     goto exit_main;
                 }
@@ -379,6 +532,11 @@ int main(int argc, char* argv[]) {
             } else {
                 updater::log("SHA256 not provided or placeholder; skipping verification.");
             }
+            const auto stagedPackage = updaterDir / ("update" + packageExt);
+            fs::copy_file(packagePath, stagedPackage);
+            fs::remove(fs::u8path(packagePath.u8string() + ".json"));
+            fs::remove(packagePath);
+            packagePath = stagedPackage;
         }
 
         // 等待主进程退出，以便安全覆盖文件
@@ -505,5 +663,8 @@ exit_main:
     if (!lockPathToCleanup.empty()) {
         updater::safeRemoveTree(lockPathToCleanup, "installation lock");
     }
+#ifdef __APPLE__
+    terminal.setResult(exitCode);
+#endif
     return exitCode;
 }
