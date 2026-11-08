@@ -7,8 +7,33 @@
 #include <iostream>
 #include <sstream>
 #include "picosha2.h"
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#endif
 
 namespace updater {
+
+// A GUI caller may capture stdout in a pipe. Keep that output and also show
+// updater messages in the visible console, without duplicating console output.
+static void mirrorToConsole(const std::string& text) {
+#ifdef _WIN32
+    DWORD mode = 0;
+    const auto output = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout)));
+    if (GetConsoleMode(output, &mode)) return;
+    const auto console = CreateFileW(L"CONOUT$", GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     nullptr, OPEN_EXISTING, 0, nullptr);
+    if (console != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(console, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+        CloseHandle(console);
+    }
+#else
+    (void)text;
+#endif
+}
 
 std::filesystem::path safeRelativePath(const std::filesystem::path& path) {
     if (path.empty() || path.has_root_path()) {
@@ -31,6 +56,7 @@ std::filesystem::path safeRelativePath(const std::filesystem::path& path) {
 
 void log(const std::string& msg) {
     std::cout << "[updater] " << msg << std::endl;
+    mirrorToConsole("[updater] " + msg + "\r\n");
 }
 
 static std::string formatBytes(size_t bytes, int mbDecimals) {
@@ -75,10 +101,12 @@ void printProgressBar(const std::string& label, double percent, size_t current, 
     }
 
     std::cout << line.str() << std::flush;
+    mirrorToConsole(line.str());
 }
 
 void progressBarEnd() {
     std::cout << std::endl;
+    mirrorToConsole("\r\n");
 }
 
 std::string trim(const std::string& s) {

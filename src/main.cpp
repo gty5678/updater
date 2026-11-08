@@ -272,20 +272,67 @@ void printHelp() {
 }  // namespace
 
 #ifdef _WIN32
+static void waitForConsoleClose(int exitCode) {
+    if (const auto quiet = std::getenv("UPDATER_NO_PAUSE"); quiet && std::string(quiet) == "1") return;
+    updater::log("更新流程已结束，退出码：" + std::to_string(exitCode));
+    updater::log("请查看上方过程信息。按 Enter 键关闭窗口。");
+    // stdin may be a pipe or NUL when launched by a desktop application.
+    // Read the visible console directly, rather than returning immediately on EOF.
+    const auto input = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_EXISTING, 0, nullptr);
+    if (input != INVALID_HANDLE_VALUE) {
+        FlushConsoleInputBuffer(input);
+        INPUT_RECORD event{};
+        DWORD count = 0;
+        while (ReadConsoleInputW(input, &event, 1, &count)) {
+            if (count && event.EventType == KEY_EVENT && event.Event.KeyEvent.bKeyDown &&
+                event.Event.KeyEvent.wVirtualKeyCode == VK_RETURN) break;
+        }
+        CloseHandle(input);
+    } else {
+        MessageBoxW(nullptr, L"更新流程已结束，请查看更新日志。点击确定关闭。",
+                    L"Updater", MB_OK | (exitCode ? MB_ICONERROR : MB_ICONINFORMATION));
+    }
+}
+
 static void showUpdateConsole() {
     // A caller may launch us with CREATE_NO_WINDOW or a hidden console.
     // Allocate a console if needed, then reconnect output for progress/logs.
-    if (!GetConsoleWindow() && AllocConsole()) {
-        std::freopen("CONOUT$", "w", stdout);
-        std::freopen("CONOUT$", "w", stderr);
-        std::cout.clear();
-        std::cerr.clear();
+    if (!GetConsoleWindow()) {
+        const auto redirected = [](DWORD stream) {
+            const auto type = GetFileType(GetStdHandle(stream));
+            return type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK;
+        };
+        const bool keepStdout = redirected(STD_OUTPUT_HANDLE);
+        const bool keepStderr = redirected(STD_ERROR_HANDLE);
+        // CREATE_NO_WINDOW can attach us to a windowless console. AllocConsole
+        // fails while still attached, so detach before creating a visible one.
+        FreeConsole();
+        if (AllocConsole()) {
+            // Preserve explicit pipe/file redirection used by callers.
+            if (!keepStdout) std::freopen("CONOUT$", "w", stdout);
+            if (!keepStderr) std::freopen("CONOUT$", "w", stderr);
+            std::cout.clear();
+            std::cerr.clear();
+        }
     }
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     SetConsoleTitleW(L"Updater - 正在更新，请勿关闭窗口");
     if (const auto window = GetConsoleWindow()) {
+        // The first ShowWindow may obey the launcher's STARTF_USESHOWWINDOW
+        // (including SW_HIDE) instead of our argument. Restore on a second call
+        // so hidden and minimized launches both become visible.
         ShowWindow(window, SW_SHOW);
+        ShowWindow(window, SW_RESTORE);
+        if (!SetForegroundWindow(window)) {
+            // Windows may deny focus to a background process. Let the user
+            // find the updater through its taskbar button in that case.
+            FLASHWINFO flash{sizeof(FLASHWINFO), window,
+                             FLASHW_TRAY | FLASHW_TIMERNOFG, 3, 0};
+            FlashWindowEx(&flash);
+        }
     }
 }
 
@@ -343,7 +390,13 @@ int main(int argc, char* argv[]) {
 #endif
 
     if (argc == 1 || (argc == 2 && std::string(argv[1]) == "--help")) {
+#ifdef _WIN32
+        if (argc == 1) showUpdateConsole();
+#endif
         printHelp();
+#ifdef _WIN32
+        if (argc == 1) waitForConsoleClose(0);
+#endif
         return 0;
     }
 
@@ -422,7 +475,8 @@ int main(int argc, char* argv[]) {
 #ifdef __APPLE__
             terminal.setResult(12);
 #endif
-            return 12;
+            exitCode = 12;
+            goto exit_main;
         }
         lockPathToCleanup = lock.u8string();
 #ifdef __APPLE__
@@ -665,6 +719,9 @@ exit_main:
     }
 #ifdef __APPLE__
     terminal.setResult(exitCode);
+#endif
+#ifdef _WIN32
+    waitForConsoleClose(exitCode);
 #endif
     return exitCode;
 }

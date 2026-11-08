@@ -18,6 +18,7 @@ import zipfile
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_UPDATER = REPO / 'dist/windows-x64/updater.exe'
 UPDATER = Path(os.environ.get('UPDATER_EXE', DEFAULT_UPDATER)).resolve()
+TEST_ENV = {**os.environ, 'UPDATER_NO_PAUSE': '1'}
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -66,7 +67,7 @@ class UpdateTests(unittest.TestCase):
     def run_update(self, *args, code=0, clean=True):
         result = subprocess.run([str(UPDATER), '--install-dir', str(self.app),
                                  '--no-start-main', *map(str, args)],
-                                capture_output=True, timeout=20)
+                                capture_output=True, timeout=20, env=TEST_ENV)
         output = (result.stdout + result.stderr).decode('utf-8', errors='replace')
         self.assertEqual(result.returncode, code, output)
         if clean:
@@ -187,7 +188,8 @@ class UpdateTests(unittest.TestCase):
         base = self.serve()
         first = subprocess.Popen([str(UPDATER), '--install-dir', str(self.app),
             '--no-start-main', '--latest-json-url', base + '/slow.json',
-            '--current-version', '1.0.0'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            '--current-version', '1.0.0'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=TEST_ENV)
         try:
             self.assertTrue(requested.wait(timeout=5), 'First updater never began download')
             self.run_update('--local-package', self.root / 'release.zip', code=12, clean=False)
